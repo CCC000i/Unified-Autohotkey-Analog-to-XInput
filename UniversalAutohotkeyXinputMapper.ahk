@@ -113,6 +113,7 @@ CustomSubroutine := RegExReplace(CustomSubroutine, "i)<WHEEL:(\w+):>", "Send, {$
 CustomSubroutine := RegExReplace(CustomSubroutine, "i)<WHEEL:(\w+):(\d+)>", "Send, {$1 down}`n        Sleep, $2`n        Send, {$1 up}")
 ; 2. Handle Custom Shorthands
 CustomSubroutine := RegExReplace(CustomSubroutine, "mi)^ahiS_(\w+)::MouseSteering\s*$", "ahiS_$1(state) {`n    if state {`n        ActivateMouseSteering()`n    }`n    else {`n        DeactivateMouseSteering()`n    }`n}")
+CustomSubroutine := RegExReplace(CustomSubroutine, "mi)^ahiS_(\w+)::MouseTranslation\s*$", "ahiS_$1(state) {`n    if state {`n        ActivateMouseTranslation()`n    }`n    else {`n        DeactivateMouseTranslation()`n    }`n}")
 ; Add future custom shorthands here using the same format before Pass 3...
 ; 3. Handle blank or 'Return' assignments (creates empty function)
 CustomSubroutine := RegExReplace(CustomSubroutine, "mi)^ahiS_(\w+)::(?:return)?\s*$", "ahiS_$1(state) {`n}")
@@ -232,19 +233,21 @@ IniRead, ExternalXInputEnabled, %settingsFile%, GlobalSettings, ExternalXInputEn
 IniRead, EnableAHI, %settingsFile%, GlobalSettings, EnableAHI, 1
 
 ; --- AHI MOUSE TO JOYSTICK SETTINGS ---
-IniRead, AHITranslateMouseToAxes, %configFile%, Settings, AHITranslateMouseToAxes, 0
-IniRead, raw_AHIMX, %configFile%, Settings, AHIMouseAxisX, RX
-IniRead, raw_AHIMY, %configFile%, Settings, AHIMouseAxisY, RY
-IniRead, AHIMouseSensitivity, %configFile%, Settings, AHIMouseSensitivity, 15.0
-IniRead, AHIMouseDecay, %configFile%, Settings, AHIMouseDecay, 0.75
+IniRead, StartupMouseSteering, %configFile%, Settings, StartupMouseSteering, 0
+IniRead, StartupMouseTranslation, %configFile%, Settings, StartupMouseTranslation, 0
+IniRead, raw_AHIMX, %configFile%, Settings, MouseTranslationAxisX, RX
+IniRead, raw_AHIMY, %configFile%, Settings, MouseTranslationAxisY, RY
+IniRead, MouseTranslationSensitivity, %configFile%, Settings, MouseTranslationSensitivity, 15.0
+IniRead, MouseTranslationDecay, %configFile%, Settings, MouseTranslationDecay, 0.75
 
 AHIMX_Parsed := ParseAxisAndMult(raw_AHIMX)
 AHIMY_Parsed := ParseAxisAndMult(raw_AHIMY)
 
 ; === Global State & Constants Object ===
 Global ScriptStartTime := A_TickCount, lastChange := 0, CLTimer := 10, hXInput := 0
-Global AHIMouseAxisX := AHIMX_Parsed.Axis, AHIMouseAxisX_Mult := AHIMX_Parsed.Mult
-Global AHIMouseAxisY := AHIMY_Parsed.Axis, AHIMouseAxisY_Mult := AHIMY_Parsed.Mult
+Global StartupMouseSteering, StartupMouseTranslation, AHIMouseTranslation := StartupMouseTranslation
+Global MouseTranslationAxisX := AHIMX_Parsed.Axis, MouseTranslationAxisX_Mult := AHIMX_Parsed.Mult
+Global MouseTranslationAxisY := AHIMY_Parsed.Axis, MouseTranslationAxisY_Mult := AHIMY_Parsed.Mult
 Global AHIMouse := { DeltaX: 0, DeltaY: 0, StickX: 0, StickY: 0, RawDeltaX: 0, RawDeltaY: 0, LastTick: A_TickCount }
 Global AHIMouseIDs := [], AHIMouseSubscribed := false
 
@@ -253,7 +256,7 @@ Global AppState := { IsGameActive: false, RunAlways: false, FocusPass: true }
 Global WindowState := { Locked: false, X: 0, Y: 0, W: 0, H: 0 }
 Global MouseState := { X: 0, Y: 0, LastX: 0, LastY: 0, SteeringActive: false }
 Global Cursors := { Visible: false, ForceHide: false, EnforceCounter: 0, VertVisible: false }
-Global SteerKey := { Down: false }
+Global SteerKey := { Down: StartupMouseSteering }
 Global ScreenCenter := { x: A_ScreenWidth // 2, y: A_ScreenHeight // 2 }
 
 ; Cache Win32 API calls
@@ -290,7 +293,8 @@ if (ExternalXInputEnabled) {
     if (hXInput) {
         pXInputGetState := DllCall("GetProcAddress", "Ptr", hXInput, "AStr", "XInputGetState", "Ptr")
         VarSetCapacity(XINPUT_STATE, 16, 0)
-        Loop, 4 {
+        Loop, 4 
+        {
             idx := A_Index - 1
             if (DllCall(pXInputGetState, "UInt", idx, "Ptr", &XINPUT_STATE) == 0)
                 ExternalGamepads.Push({Type: "XInput", ID: idx})
@@ -452,6 +456,10 @@ CoreLoop:
     }
 
     ; --- Game Is Active Execution Flow ---
+    if (!AppState.FocusPass) {
+        SteerKey.Down := StartupMouseSteering
+        AHIMouseTranslation := StartupMouseTranslation
+    }
     AppState.FocusPass := true
 
     ManageAHISubscriptions()
@@ -460,12 +468,12 @@ CoreLoop:
     MouseGetPos, currentX, currentY
     MouseState.X := currentX, MouseState.Y := currentY
 
-    if (AHITranslateMouseToAxes)
+    if (AHIMouseTranslation)
         UpdateAHIMousePhysics()
 
     UpdateAllVirtualAxes()
     
-    if (AHITranslateMouseToAxes)
+    if (AHIMouseTranslation)
         ApplyAHISpringReturn()
 
     EnforceMouseLockAndCursor()
@@ -497,18 +505,27 @@ UpdateActiveWindowBounds() {
 }
 
 ManageAHISubscriptions() {
-    global AHITranslateMouseToAxes, AHIMouseSubscribed, AHIMouseIDs, ahi
+    global AHIMouseTranslation, AHIMouseSubscribed, AHIMouseIDs, ahi, AHIMouse
     
-    if (AHITranslateMouseToAxes && !AHIMouseSubscribed) {
+    if (AHIMouseTranslation && !AHIMouseSubscribed) {
         for _, mId in AHIMouseIDs {
             ahi.SubscribeMouseMoveRelative(mId, true, Func("Core_ahiOnMouseMoveRelative"))
         }
         AHIMouseSubscribed := true
+    } else if (!AHIMouseTranslation && AHIMouseSubscribed) {
+        for _, mId in AHIMouseIDs {
+            ahi.UnsubscribeMouseMoveRelative(mId)
+        }
+        AHIMouseSubscribed := false
+        AHIMouse.DeltaX := 0
+        AHIMouse.DeltaY := 0
+        AHIMouse.StickX := 0
+        AHIMouse.StickY := 0
     }
 }
 
 UpdateAHIMousePhysics() {
-    global AHIMouse, AHIMouseAxisX_Mult, AHIMouseAxisY_Mult, AHIMouseSensitivity, AHIMouseDecay, CLTimer
+    global AHIMouse, MouseTranslationAxisX_Mult, MouseTranslationAxisY_Mult, MouseTranslationSensitivity, MouseTranslationDecay, CLTimer
     
     ; Prevent Dropped Inputs (Race Condition Fix)
     Critical, On
@@ -527,16 +544,16 @@ UpdateAHIMousePhysics() {
 
     ; Normalize deltas against the expected dynamic loop timer
     normFactor := CLTimer / dt
-    velX := rawDeltaX * normFactor * AHIMouseAxisX_Mult
-    velY := (rawDeltaY * -1) * normFactor * AHIMouseAxisY_Mult
+    velX := rawDeltaX * normFactor * MouseTranslationAxisX_Mult
+    velY := (rawDeltaY * -1) * normFactor * MouseTranslationAxisY_Mult
 
     ; Velocity-Targeting
-    targetX := velX * AHIMouseSensitivity * 3.0
-    targetY := velY * AHIMouseSensitivity * 3.0
+    targetX := velX * MouseTranslationSensitivity * 3.0
+    targetY := velY * MouseTranslationSensitivity * 3.0
 
     ; Apply Decay (Weight/Return Speed)
-    AHIMouse.StickX := (rawDeltaX != 0) ? targetX : AHIMouse.StickX * AHIMouseDecay
-    AHIMouse.StickY := (rawDeltaY != 0) ? targetY : AHIMouse.StickY * AHIMouseDecay
+    AHIMouse.StickX := (rawDeltaX != 0) ? targetX : AHIMouse.StickX * MouseTranslationDecay
+    AHIMouse.StickY := (rawDeltaY != 0) ? targetY : AHIMouse.StickY * MouseTranslationDecay
 
     ; Clamp to XInput limits
     AHIMouse.StickX := Max(-255, Min(255, AHIMouse.StickX))
@@ -654,7 +671,7 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
 CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
     global ScreenCenter, MouseState, MathVars, LX_D_MovesMouse, WootingDeadzone, ExtTriggerDeadzone
     global ExtPadState, WootingEnabled, MouseSteeringAxisX
-    global MouseSteeringAxisX_Mult, AHIMouse, AHITranslateMouseToAxes, AHIMouseAxisX, AHIMouseAxisY
+    global MouseSteeringAxisX_Mult, AHIMouse, AHIMouseTranslation, MouseTranslationAxisX, MouseTranslationAxisY
     
     pressure := 0, hasDigital := false
     
@@ -691,10 +708,10 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
         }
         
         ; AHI Relative Translation
-        if (AHITranslateMouseToAxes && isStick) {
-            if (axis == AHIMouseAxisX)
+        if (AHIMouseTranslation && isStick) {
+            if (axis == MouseTranslationAxisX)
                 pressure += AHIMouse.StickX
-            else if (axis == AHIMouseAxisY)
+            else if (axis == MouseTranslationAxisY)
                 pressure += AHIMouse.StickY
         }
     }
@@ -793,7 +810,7 @@ EnforceMouseLockAndCursor() {
             DllCall(pSetWindowPos, "Ptr", CrosshairHwnd, "Ptr", 0, "Int", MouseState.X-8, "Int", MouseState.Y-8, "Int", 0, "Int", 0, "UInt", 0x15)
         if (EnableVerticalLine && Cursors.VertVisible)
             DllCall(pSetWindowPos, "Ptr", LineHwnd, "Ptr", 0, "Int", MouseState.X, "Int", WindowState.Y, "Int", 0, "Int", 0, "UInt", 0x15)
-         
+        
         MouseState.LastX := MouseState.X, MouseState.LastY := MouseState.Y
     }
 }
@@ -804,6 +821,16 @@ ActivateMouseSteering() {
 
 DeactivateMouseSteering() {
     SteerKey.Down := false
+}
+
+ActivateMouseTranslation() {
+    global AHIMouseTranslation
+    AHIMouseTranslation := true
+}
+
+DeactivateMouseTranslation() {
+    global AHIMouseTranslation
+    AHIMouseTranslation := false
 }
 
 ; === DYNAMIC INTERCEPTION HANDLERS ===
@@ -944,6 +971,7 @@ ParseDigital(iniStr) {
     arr := []
     if (iniStr == "" || iniStr == "ERROR")
         return arr
+    
     Loop, Parse, iniStr, `,
     {
         parts := StrSplit(A_LoopField, ":")
