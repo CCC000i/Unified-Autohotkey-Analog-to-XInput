@@ -102,6 +102,19 @@ CustomAutoexecute := MatchAuto1
 RegExMatch(FileContent, "ms)\[CustomSubroutine\]\R*(.*?)(?=^\[|\z)", MatchSub)
 CustomSubroutine := MatchSub1
 
+; --- Extract $ prefixed digital binds for empty AHI subscriptions ---
+RegExMatch(FileContent, "ms)\[DigitalBinds\]\R*(.*?)(?=^\[|\z)", MatchDig)
+Pos := 1
+SubscribedKeys := {}
+while (Pos := RegExMatch(MatchDig1, "O)\$([a-zA-Z0-9_]+)\s*:", M, Pos)) {
+    keyName := M.Value(1)
+    if (!SubscribedKeys.HasKey(keyName)) {
+        SubscribedKeys[keyName] := true
+        CustomSubroutine .= "`nahiS_" . keyName . "(state) {`n}`n"
+    }
+    Pos += M.Len(0)
+}
+
 ; --- AHI Shorthand Expansion ---
 ; 1. Handle Wheel / HWheel assignments
 CustomSubroutine := RegExReplace(CustomSubroutine, "mi)^ahiS_(H?Wheel)::(\w+),(\w+)(?:,(\d+))?\s*$", "ahiS_$1(direction) {`n    if (direction == 1) {`n        <WHEEL:$2:$4>`n    } else if (direction == -1) {`n        <WHEEL:$3:$4>`n    }`n}")
@@ -249,7 +262,7 @@ Global StartupMouseSteering, StartupMouseTranslation, AHIMouseTranslation := Sta
 Global MouseTranslationAxisX := AHIMX_Parsed.Axis, MouseTranslationAxisX_Mult := AHIMX_Parsed.Mult
 Global MouseTranslationAxisY := AHIMY_Parsed.Axis, MouseTranslationAxisY_Mult := AHIMY_Parsed.Mult
 Global AHIMouse := { DeltaX: 0, DeltaY: 0, StickX: 0, StickY: 0, RawDeltaX: 0, RawDeltaY: 0, LastTick: A_TickCount }
-Global AHIMouseIDs := [], AHIMouseSubscribed := false
+Global AHIMouseIDs := [], AHIMouseSubscribed := false, AHI_DigiState := {}
 
 Global CONST := { MULT_POS: 128.49803, MULT_NEG: 128.50196, READ_MULT: 0.00778198, DINPUT_MULT: 5.1 }
 Global AppState := { IsGameActive: false, RunAlways: false, FocusPass: true }
@@ -671,12 +684,12 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
 CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
     global ScreenCenter, MouseState, MathVars, LX_D_MovesMouse, WootingDeadzone, ExtTriggerDeadzone
     global ExtPadState, WootingEnabled, MouseSteeringAxisX
-    global MouseSteeringAxisX_Mult, AHIMouse, AHIMouseTranslation, MouseTranslationAxisX, MouseTranslationAxisY
+    global MouseSteeringAxisX_Mult, AHIMouse, AHIMouseTranslation, MouseTranslationAxisX, MouseTranslationAxisY, AHI_DigiState
     
     pressure := 0, hasDigital := false
     
     for _, pair in dArray {
-        if GetKeyState(pair[1], "P") {
+        if (GetKeyState(pair[1], "P") || AHI_DigiState[pair[1]]) {
             pressure := pair[2]
             if (isStick && axis == MouseSteeringAxisX && LX_D_MovesMouse) {
                 signX := MouseSteeringAxisX_Mult < 0 ? -1 : 1
@@ -836,19 +849,23 @@ DeactivateMouseTranslation() {
 ; === DYNAMIC INTERCEPTION HANDLERS ===
 
 Core_DynamicKeyHandler(keyName, sc, kId, state) {
-    global AppState, ahi
-    if (AppState.IsGameActive)
+    global AppState, ahi, AHI_DigiState
+    if (AppState.IsGameActive) {
+        AHI_DigiState[keyName] := state
         Func("ahiS_" . keyName).Call(state)
-    else
+    } else {
         ahi.SendKeyEvent(kId, sc, state)
+    }
 }
 
 Core_DynamicMouseBtnHandler(btnName, btnId, mId, state) {
-    global AppState, ahi
-    if (AppState.IsGameActive)
+    global AppState, ahi, AHI_DigiState
+    if (AppState.IsGameActive) {
+        AHI_DigiState[btnName] := state
         Func("ahiS_" . btnName).Call(state)
-    else
+    } else {
         ahi.SendMouseButtonEvent(mId, btnId, state)
+    }
 }
 
 Core_DynamicMouseWheelHandler(mId, direction) {
@@ -898,7 +915,7 @@ ReadIni(file, key, section := "AnalogBinds") {
 FocusLost() {
     Click, Middle Up 
     global lastAxisState, pad, SteerKey
-    global ahi, AHIMouseIDs, AHIMouseSubscribed, AHIMouse
+    global ahi, AHIMouseIDs, AHIMouseSubscribed, AHIMouse, AHI_DigiState
     
     ; --- DYNAMIC MOUSE UNSUBSCRIPTION ON FOCUS LOST ---
     if (AHIMouseSubscribed) {
@@ -918,6 +935,7 @@ FocusLost() {
             pad.Axes[axis].SetState(0)
         }
     }
+    AHI_DigiState := {}
     SteerKey.Down := false
     CleanupMouseLockAndHide()
 }
@@ -975,8 +993,12 @@ ParseDigital(iniStr) {
     Loop, Parse, iniStr, `,
     {
         parts := StrSplit(A_LoopField, ":")
-        if (parts.Length() == 2)
-            arr.Push([Trim(parts[1]), Trim(parts[2]) + 0.0])
+        if (parts.Length() == 2) {
+            k := Trim(parts[1])
+            if (SubStr(k, 1, 1) == "$")
+                k := SubStr(k, 2)
+            arr.Push([k, Trim(parts[2]) * 2.55])
+        }
     }
     return arr
 }
