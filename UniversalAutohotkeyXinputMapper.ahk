@@ -248,7 +248,7 @@ Global StartupMouseSteering, StartupMouseTranslation, AHIMouseTranslation := Sta
 Global MouseTranslationAxisX := AHIMX_Parsed.Axis, MouseTranslationAxisX_Mult := AHIMX_Parsed.Mult
 Global MouseTranslationAxisY := AHIMY_Parsed.Axis, MouseTranslationAxisY_Mult := AHIMY_Parsed.Mult
 Global AHIMouse := { DeltaX: 0, DeltaY: 0, StickX: 0, StickY: 0, RawDeltaX: 0, RawDeltaY: 0, LastTick: A_TickCount }
-Global AHIMouseIDs := [], AHIMouseSubscribed := false, AHI_DigiState := {}
+Global AHIMouseIDs := [], AHIMouseSubscribed := false, AHI_DigiState := {}, Global DigiOverride := {}
 
 Global CONST := { MULT_POS: 128.49803, MULT_NEG: 128.50196, READ_MULT: 0.00778198, DINPUT_MULT: 5.1 }
 Global AppState := { IsGameActive: false, RunAlways: false, FocusPass: true }
@@ -563,6 +563,7 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
     global ADZ_Calc, Linearity_Calc, ExtPadState, ExtStickDeadzone, MathVars
     global MouseState, ScreenCenter, MouseSteeringAxisX, MouseSteeringAxisY
     global MouseSteeringAxisX_Mult, MouseSteeringAxisY_Mult, AnalogSupersedesMouse
+    global DigiOverride ; Add this line
 
     extX := ExtPadState[axisX]
     extY := ExtPadState[axisY]
@@ -571,8 +572,10 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
     if (extMag > ExtStickDeadzone && extMag > 0) {
         clampedExtMag := (extMag > 255) ? 255 : extMag
         extNorm := (clampedExtMag - ExtStickDeadzone) * MathVars.ExtS_Mult
-        x += (extX / extMag) * extNorm
-        y += (extY / extMag) * extNorm
+        if (!DigiOverride[axisX]) ; Prevent external stick X from stacking
+            x += (extX / extMag) * extNorm
+        if (!DigiOverride[axisY]) ; Prevent external stick Y from stacking
+            y += (extY / extMag) * extNorm
     }
 
     if (MouseState.SteeringActive) {
@@ -580,7 +583,7 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
         isMouseY := (axisY == MouseSteeringAxisY)
         mouseXPress := 0, mouseYPress := 0
         
-        if (isMouseX) {
+        if (isMouseX && !DigiOverride[axisX]) { ; Lockout mouse steering X
             distX := MouseState.X - ScreenCenter.x
             absDistX := Abs(distX)
             if (absDistX > MathVars.MaxDist)
@@ -592,7 +595,7 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
             }
         }
         
-        if (isMouseY) {
+        if (isMouseY && !DigiOverride[axisY]) { ; Lockout mouse steering Y
             distY := ScreenCenter.y - MouseState.Y
             absDistY := Abs(distY)
             if (absDistY > MathVars.MaxDist)
@@ -642,8 +645,11 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
     global ScreenCenter, MouseState, MathVars, LX_D_MovesMouse, WootingDeadzone, ExtTriggerDeadzone
     global ExtPadState, WootingEnabled, MouseSteeringAxisX
     global MouseSteeringAxisX_Mult, AHIMouse, AHIMouseTranslation, MouseTranslationAxisX, MouseTranslationAxisY, AHI_DigiState
+    global DigiOverride ; Add this line
     
     pressure := 0
+    DigiOverride[axis] := false ; Reset flag per tick
+    
     for _, pair in dArray {
         if (GetKeyState(pair[1], "P") || AHI_DigiState[pair[1]]) {
             pressure := pair[2]
@@ -652,6 +658,7 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
                 targetX := Round(ScreenCenter.x + (pressure * MathVars.MaxDist_Div255 * signX))
                 MouseMove, %targetX%, % MouseState.Y, 0
             }
+            DigiOverride[axis] := true ; Lockout engaged
             return pressure ; Optimization: Skip evaluating analog if a digital key is fully pressed
         }
     }
