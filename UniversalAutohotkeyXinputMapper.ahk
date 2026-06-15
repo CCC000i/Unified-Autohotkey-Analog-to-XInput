@@ -685,16 +685,13 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
 
 CommitVirtualPressure(axis, isStick, pressure) {
     global lastAxisState, CONST, ADZ_Calc, Linearity_Calc, pad
-    
     pressure := isStick ? Max(-255, Min(255, pressure)) : Max(0, Min(255, pressure))
-    
     if (!isStick) {
         if (Linearity_Calc[axis] != 1.0 && pressure != 0) {
             pSign := (pressure < 0) ? -1 : 1
             pNorm := Abs(pressure) / 255.0
             pressure := (pNorm ** Linearity_Calc[axis]) * 255.0 * pSign
         }
-        
         if (ADZ_Calc[axis].Raw > 0 && pressure != 0) {
             calc_raw := ADZ_Calc[axis].Raw
             calc_scale := ADZ_Calc[axis].Scale
@@ -702,9 +699,12 @@ CommitVirtualPressure(axis, isStick, pressure) {
                 pressure := calc_raw + (pressure * calc_scale)
         }
     }
-    
     finalVal := isStick ? Round(pressure * (pressure < 0 ? CONST.MULT_NEG : CONST.MULT_POS)) : Round(pressure)
-    
+    ; --- Prevent Int16 boundary casting errors ---
+    if (isStick)
+        finalVal := Max(-32767, Min(32767, finalVal))
+    else
+        finalVal := Max(0, Min(255, finalVal))
     if (finalVal != lastAxisState[axis]) {
         lastAxisState[axis] := finalVal
         pad.Axes[axis].SetState(finalVal)
