@@ -203,7 +203,7 @@ ParseExeMatches(iniStr) {
 #Persistent
 #SingleInstance Force
 #UseHook
-#InputLevel 20
+#InputLevel 60
 #HotkeyInterval 0
 SetBatchLines, -1
 CoordMode, Mouse, Screen
@@ -269,7 +269,7 @@ Global pSystemParametersInfo := DllCall("GetProcAddress", "Ptr", hUser32, "AStr"
 Global pDestroyCursor := DllCall("GetProcAddress", "Ptr", hUser32, "AStr", "DestroyCursor", "Ptr")
 
 Global MathVars := { MaxDist: 0, MousePressureMult: 0, WD_Mult: 1.0, ExtS_Mult: 1.0, ExtT_Mult: 1.0, MaxDist_Div255: 0, MS_DeadzonePixels: 0 }
-Global ADZ_Calc := {}, Linearity_Calc := {}
+Global ADZ_Calc := {}, Linearity_Calc := {}, Out_Calc := {}
 Global SysCursorsList := [32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650]
 Global lastAxisState := {LX: 0, LY: 0, RX: 0, RY: 0, LT: 0, RT: 0}
 
@@ -386,6 +386,17 @@ For _, ax in ["LX", "LY", "RX", "RY", "LT", "RT"] {
     IniRead, linRaw, %configFile%, Settings, %ax%_Linearity, 0.5
     linRaw := Max(0.0001, Min(0.9999, linRaw))
     Linearity_Calc[ax] := (1.0 - linRaw) / linRaw
+    
+    ; --- Min and Max Output Parsing ---
+    IniRead, minRaw, %configFile%, Settings, %ax%_Min, 0
+    IniRead, maxRaw, %configFile%, Settings, %ax%_Max, 100
+    
+    minRaw := Max(0, Min(100, minRaw))
+    maxRaw := Max(0, Min(100, maxRaw))
+    if (minRaw > maxRaw)
+        minRaw := maxRaw
+        
+    Out_Calc[ax] := { Min: minRaw * 2.55, Range: (maxRaw - minRaw) * 2.55 }
 }
 
 Global LX_A := ParseAnalog(ReadIni(configFile, "LX_A")), LX_D := ParseDigital(ReadIni(configFile, "LX_D", "DigitalBinds"))
@@ -691,7 +702,7 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
 }
 
 CommitVirtualPressure(axis, isStick, pressure) {
-    global lastAxisState, CONST, ADZ_Calc, Linearity_Calc, pad
+    global lastAxisState, CONST, ADZ_Calc, Linearity_Calc, Out_Calc, pad
     pressure := isStick ? Max(-255, Min(255, pressure)) : Max(0, Min(255, pressure))
     if (!isStick) {
         if (Linearity_Calc[axis] != 1.0 && pressure != 0) {
@@ -706,6 +717,15 @@ CommitVirtualPressure(axis, isStick, pressure) {
                 pressure := calc_raw + (pressure * calc_scale)
         }
     }
+    
+    ; --- Apply Independent Axis Min/Max Output Scaling ---
+    if (pressure != 0) {
+        mag := Abs(pressure)
+        magNorm := mag / 255.0
+        newMag := Out_Calc[axis].Min + (magNorm * Out_Calc[axis].Range)
+        pressure := (pressure < 0) ? -newMag : newMag
+    }
+    
     finalVal := isStick ? Round(pressure * (pressure < 0 ? CONST.MULT_NEG : CONST.MULT_POS)) : Round(pressure)
     ; --- Prevent Int16 boundary casting errors ---
     if (isStick)
