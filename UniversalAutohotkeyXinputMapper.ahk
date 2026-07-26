@@ -203,7 +203,7 @@ ParseExeMatches(iniStr) {
 #Persistent
 #SingleInstance Force
 #UseHook
-#InputLevel 20
+#InputLevel 100
 #HotkeyInterval 0
 SetBatchLines, -1
 CoordMode, Mouse, Screen
@@ -242,13 +242,22 @@ AHIMX_Parsed := ParseAxisAndMult(raw_AHIMX)
 AHIMY_Parsed := ParseAxisAndMult(raw_AHIMY)
 
 ; === Global State & Constants Object ===
-Global ScriptStartTime := A_TickCount, lastChange := 0, CLTimer := 5, hXInput := 0
+Global ScriptStartTime := A_TickCount
+Global lastChange := 0
+Global CLTimer := 5
+Global hXInput := 0
 Global ActiveGameHWND := 0 ; cached window handle
-Global StartupMouseSteering, StartupMouseTranslation, AHIMouseTranslation := StartupMouseTranslation
-Global MouseTranslationAxisX := AHIMX_Parsed.Axis, MouseTranslationAxisX_Mult := AHIMX_Parsed.Mult
-Global MouseTranslationAxisY := AHIMY_Parsed.Axis, MouseTranslationAxisY_Mult := AHIMY_Parsed.Mult
+Global StartupMouseSteering, StartupMouseTranslation
+Global AHIMouseTranslation := StartupMouseTranslation
+Global MouseTranslationAxisX := AHIMX_Parsed.Axis
+Global MouseTranslationAxisX_Mult := AHIMX_Parsed.Mult
+Global MouseTranslationAxisY := AHIMY_Parsed.Axis
+Global MouseTranslationAxisY_Mult := AHIMY_Parsed.Mult
 Global AHIMouse := { DeltaX: 0, DeltaY: 0, StickX: 0, StickY: 0, RawDeltaX: 0, RawDeltaY: 0, LastTick: A_TickCount }
-Global AHIMouseIDs := [], AHIMouseSubscribed := false, AHI_DigiState := {}, Global DigiOverride := {}
+Global AHIMouseIDs := []
+Global AHIMouseSubscribed := false
+Global AHI_DigiState := {}
+Global DigiOverride := {}
 
 Global CONST := { MULT_POS: 128.49803, MULT_NEG: 128.50196, READ_MULT: 0.00778198, DINPUT_MULT: 5.1 }
 Global AppState := { IsGameActive: false, RunAlways: false, FocusPass: true }
@@ -270,6 +279,7 @@ Global pDestroyCursor := DllCall("GetProcAddress", "Ptr", hUser32, "AStr", "Dest
 
 Global MathVars := { MaxDist: 0, MousePressureMult: 0, WD_Mult: 1.0, ExtS_Mult: 1.0, ExtT_Mult: 1.0, MaxDist_Div255: 0, MS_DeadzonePixels: 0 }
 Global ADZ_Calc := {}, Linearity_Calc := {}
+Global OuterThreshold := {}
 Global SysCursorsList := [32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650]
 Global lastAxisState := {LX: 0, LY: 0, RX: 0, RY: 0, LT: 0, RT: 0}
 
@@ -388,12 +398,26 @@ For _, ax in ["LX", "LY", "RX", "RY", "LT", "RT"] {
     Linearity_Calc[ax] := (1.0 - linRaw) / linRaw
 }
 
-Global LX_A := ParseAnalog(ReadIni(configFile, "LX_A")), LX_D := ParseDigital(ReadIni(configFile, "LX_D", "DigitalBinds"))
-Global LY_A := ParseAnalog(ReadIni(configFile, "LY_A")), LY_D := ParseDigital(ReadIni(configFile, "LY_D", "DigitalBinds"))
-Global RX_A := ParseAnalog(ReadIni(configFile, "RX_A")), RX_D := ParseDigital(ReadIni(configFile, "RX_D", "DigitalBinds"))
-Global RY_A := ParseAnalog(ReadIni(configFile, "RY_A")), RY_D := ParseDigital(ReadIni(configFile, "RY_D", "DigitalBinds"))
-Global LT_A := ParseAnalog(ReadIni(configFile, "LT_A")), LT_D := ParseDigital(ReadIni(configFile, "LT_D", "DigitalBinds"))
-Global RT_A := ParseAnalog(ReadIni(configFile, "RT_A")), RT_D := ParseDigital(ReadIni(configFile, "RT_D", "DigitalBinds"))
+For _, ax in ["LX", "LY", "RX", "RY", "LT", "RT"] {
+    IniRead, outerRaw, %configFile%, Settings, %ax%_OuterDeadzone, 0
+    outerRaw := Max(0, Min(100, outerRaw))
+    OuterThreshold[ax] := 255 * (1 - outerRaw/100)
+    if (OuterThreshold[ax] < 0) ; safety
+        OuterThreshold[ax] := 0
+}
+
+Global LX_A := ParseAnalog(ReadIni(configFile, "LX_A"))
+Global LX_D := ParseDigital(ReadIni(configFile, "LX_D", "DigitalBinds"))
+Global LY_A := ParseAnalog(ReadIni(configFile, "LY_A"))
+Global LY_D := ParseDigital(ReadIni(configFile, "LY_D", "DigitalBinds"))
+Global RX_A := ParseAnalog(ReadIni(configFile, "RX_A"))
+Global RX_D := ParseDigital(ReadIni(configFile, "RX_D", "DigitalBinds"))
+Global RY_A := ParseAnalog(ReadIni(configFile, "RY_A"))
+Global RY_D := ParseDigital(ReadIni(configFile, "RY_D", "DigitalBinds"))
+Global LT_A := ParseAnalog(ReadIni(configFile, "LT_A"))
+Global LT_D := ParseDigital(ReadIni(configFile, "LT_D", "DigitalBinds"))
+Global RT_A := ParseAnalog(ReadIni(configFile, "RT_A"))
+Global RT_D := ParseDigital(ReadIni(configFile, "RT_D", "DigitalBinds"))
 
 if (exeName.Length() == 0) {
     AppState.RunAlways := true
@@ -546,24 +570,34 @@ UpdateAHIMousePhysics() {
 
 UpdateAllVirtualAxes() {
     global LX_D, LX_A, LY_D, LY_A, RX_D, RX_A, RY_D, RY_A, LT_D, LT_A, RT_D, RT_A
-    
-    lx := CalcVirtualPressure("LX", true, LX_D, LX_A), ly := CalcVirtualPressure("LY", true, LY_D, LY_A)
-    rx := CalcVirtualPressure("RX", true, RX_D, RX_A), ry := CalcVirtualPressure("RY", true, RY_D, RY_A)
-    lt := CalcVirtualPressure("LT", false, LT_D, LT_A), rt := CalcVirtualPressure("RT", false, RT_D, RT_A)
-    
+    global OuterThreshold ; needed for outer scaling
+
+    lx := CalcVirtualPressure("LX", true, LX_D, LX_A)
+    ly := CalcVirtualPressure("LY", true, LY_D, LY_A)
+    rx := CalcVirtualPressure("RX", true, RX_D, RX_A)
+    ry := CalcVirtualPressure("RY", true, RY_D, RY_A)
+    lt := CalcVirtualPressure("LT", false, LT_D, LT_A)
+    rt := CalcVirtualPressure("RT", false, RT_D, RT_A)
+
     ApplyRadialStick(lx, ly, "LX", "LY")
     ApplyRadialStick(rx, ry, "RX", "RY")
-    
-    CommitVirtualPressure("LX", true, lx), CommitVirtualPressure("LY", true, ly)
-    CommitVirtualPressure("RX", true, rx), CommitVirtualPressure("RY", true, ry)
-    CommitVirtualPressure("LT", false, lt), CommitVirtualPressure("RT", false, rt)
+
+    lt := ApplyOuterScaling("LT", lt)
+    rt := ApplyOuterScaling("RT", rt)
+
+    CommitVirtualPressure("LX", true, lx)
+    CommitVirtualPressure("LY", true, ly)
+    CommitVirtualPressure("RX", true, rx)
+    CommitVirtualPressure("RY", true, ry)
+    CommitVirtualPressure("LT", false, lt)
+    CommitVirtualPressure("RT", false, rt)
 }
 
 ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
     global ADZ_Calc, Linearity_Calc, ExtPadState, ExtStickDeadzone, MathVars
     global MouseState, ScreenCenter, MouseSteeringAxisX, MouseSteeringAxisY
     global MouseSteeringAxisX_Mult, MouseSteeringAxisY_Mult, AnalogSupersedesMouse
-    global DigiOverride ; Add this line
+    global DigiOverride, OuterThreshold
 
     extX := ExtPadState[axisX]
     extY := ExtPadState[axisY]
@@ -572,9 +606,9 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
     if (extMag > ExtStickDeadzone && extMag > 0) {
         clampedExtMag := (extMag > 255) ? 255 : extMag
         extNorm := (clampedExtMag - ExtStickDeadzone) * MathVars.ExtS_Mult
-        if (!DigiOverride[axisX]) ; Prevent external stick X from stacking
+        if (!DigiOverride[axisX])
             x += (extX / extMag) * extNorm
-        if (!DigiOverride[axisY]) ; Prevent external stick Y from stacking
+        if (!DigiOverride[axisY])
             y += (extY / extMag) * extNorm
     }
 
@@ -583,7 +617,7 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
         isMouseY := (axisY == MouseSteeringAxisY)
         mouseXPress := 0, mouseYPress := 0
         
-        if (isMouseX && !DigiOverride[axisX]) { ; Lockout mouse steering X
+        if (isMouseX && !DigiOverride[axisX]) {
             distX := MouseState.X - ScreenCenter.x
             absDistX := Abs(distX)
             if (absDistX > MathVars.MaxDist)
@@ -595,7 +629,7 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
             }
         }
         
-        if (isMouseY && !DigiOverride[axisY]) { ; Lockout mouse steering Y
+        if (isMouseY && !DigiOverride[axisY]) {
             distY := ScreenCenter.y - MouseState.Y
             absDistY := Abs(distY)
             if (absDistY > MathVars.MaxDist)
@@ -617,6 +651,9 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
             y += mouseYPress
         }
     }
+
+    x := ApplyOuterScaling(axisX, x)
+    y := ApplyOuterScaling(axisY, y)
 
     mag := Sqrt((x * x) + (y * y))
     if (mag == 0)
@@ -641,14 +678,28 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
     y := Round((y / mag) * newMag)
 }
 
+ApplyOuterScaling(axis, value) {
+    global OuterThreshold
+    threshold := OuterThreshold[axis]
+    if (threshold > 0) {
+        if (Abs(value) > threshold)
+            return (value > 0 ? 255 : -255)
+        else
+            return Round(value * (255 / threshold))
+    } else {
+        ; threshold == 0 means saturate immediately
+        return (value > 0 ? 255 : -255)
+    }
+}
+
 CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
     global ScreenCenter, MouseState, MathVars, LX_D_MovesMouse, WootingDeadzone, ExtTriggerDeadzone
     global ExtPadState, WootingEnabled, MouseSteeringAxisX
     global MouseSteeringAxisX_Mult, AHIMouse, AHIMouseTranslation, MouseTranslationAxisX, MouseTranslationAxisY, AHI_DigiState
-    global DigiOverride ; Add this line
+    global DigiOverride
     
     pressure := 0
-    DigiOverride[axis] := false ; Reset flag per tick
+    DigiOverride[axis] := false
     
     for _, pair in dArray {
         if (GetKeyState(pair[1], "P") || AHI_DigiState[pair[1]]) {
@@ -658,8 +709,8 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
                 targetX := Round(ScreenCenter.x + (pressure * MathVars.MaxDist_Div255 * signX))
                 MouseMove, %targetX%, % MouseState.Y, 0
             }
-            DigiOverride[axis] := true ; Lockout engaged
-            return pressure ; Optimization: Skip evaluating analog if a digital key is fully pressed
+            DigiOverride[axis] := true
+            return pressure
         }
     }
     
@@ -707,7 +758,6 @@ CommitVirtualPressure(axis, isStick, pressure) {
         }
     }
     finalVal := isStick ? Round(pressure * (pressure < 0 ? CONST.MULT_NEG : CONST.MULT_POS)) : Round(pressure)
-    ; --- Prevent Int16 boundary casting errors ---
     if (isStick)
         finalVal := Max(-32767, Min(32767, finalVal))
     else
