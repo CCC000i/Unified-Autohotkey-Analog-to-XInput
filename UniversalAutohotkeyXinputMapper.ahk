@@ -265,6 +265,7 @@ Global WindowState := { Locked: false, X: 0, Y: 0, W: 0, H: 0 }
 Global MouseState := { X: 0, Y: 0, LastX: 0, LastY: 0, SteeringActive: false }
 Global Cursors := { Visible: false, ForceHide: false, EnforceCounter: 0, VertVisible: false }
 Global SteerKey := { Down: StartupMouseSteering }
+Global ControllerActive := true
 Global ScreenCenter := { x: A_ScreenWidth // 2, y: A_ScreenHeight // 2 }
 
 ; Cache Win32 API calls
@@ -742,7 +743,7 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
 }
 
 CommitVirtualPressure(axis, isStick, pressure) {
-    global lastAxisState, CONST, ADZ_Calc, Linearity_Calc, pad
+    global lastAxisState, CONST, ADZ_Calc, Linearity_Calc, pad, ControllerActive
     pressure := isStick ? Max(-255, Min(255, pressure)) : Max(0, Min(255, pressure))
     if (!isStick) {
         if (Linearity_Calc[axis] != 1.0 && pressure != 0) {
@@ -764,7 +765,8 @@ CommitVirtualPressure(axis, isStick, pressure) {
         finalVal := Max(0, Min(255, finalVal))
     if (finalVal != lastAxisState[axis]) {
         lastAxisState[axis] := finalVal
-        pad.Axes[axis].SetState(finalVal)
+        if (ControllerActive)
+            pad.Axes[axis].SetState(finalVal)
     }
 }
 
@@ -840,6 +842,18 @@ ActivateMouseTranslation() {
 DeactivateMouseTranslation() {
     global AHIMouseTranslation
     AHIMouseTranslation := false
+}
+ActivateController() {
+    global ControllerActive, lastAxisState, pad
+    ControllerActive := true
+    for axis, val in lastAxisState
+        pad.Axes[axis].SetState(val)
+}
+DeactivateController() {
+    global ControllerActive, lastAxisState, pad
+    ControllerActive := false
+    for axis in lastAxisState
+        pad.Axes[axis].SetState(0)
 }
 
 ; === DYNAMIC INTERCEPTION HANDLERS ===
