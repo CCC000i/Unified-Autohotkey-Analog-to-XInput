@@ -114,6 +114,19 @@ while (Pos := RegExMatch(MatchDig1, "O)\$([a-zA-Z0-9_]+)\s*:", M, Pos)) {
     Pos += M.Len(0)
 }
 
+; --- Extract $ prefixed keys from [DigitalButtons] for empty AHI subscriptions ---
+RegExMatch(FileContent, "ms)\[DigitalButtons\]\R*(.*?)(?=^\[|\z)", MatchBtn)
+Pos := 1
+while (Pos := RegExMatch(MatchBtn1, "O)[=,]\s*\$([a-zA-Z0-9_]+)", M, Pos)) {
+    keyName := M.Value(1)
+    if (!SubscribedKeys.HasKey(keyName)) {
+        SubscribedKeys[keyName] := true
+        if (!RegExMatch(CustomSubroutine, "mi)^[ \t]*ahiS_" . keyName . "[ \t]*(::|\()"))
+            CustomSubroutine .= "`nahiS_" . keyName . "(state) {`n}`n"
+    }
+    Pos += M.Len(0)
+}
+
 ; --- AHI Shorthand Expansion ---
 CustomSubroutine := RegExReplace(CustomSubroutine, "mi)^[ \t]*ahiS_(H?Wheel)[ \t]*::[ \t]*(\w+),(\w+)(?:,(\d+))?[ \t\r]*(?:;.*)?$", "ahiS_$1(direction) {`n    if (direction == 1) {`n        <WHEEL:$2:$4>`n    } else if (direction == -1) {`n        <WHEEL:$3:$4>`n    }`n}")
 CustomSubroutine := RegExReplace(CustomSubroutine, "i)[ \t]*<WHEEL:return:[^>]*>", "")
@@ -279,6 +292,10 @@ Global ADZ_Calc := {}, Linearity_Calc := {}
 Global OuterThreshold := {}
 Global SysCursorsList := [32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650]
 Global lastAxisState := {LX: 0, LY: 0, RX: 0, RY: 0, LT: 0, RT: 0}
+Global ButtonBinds := {}      ; "A" -> ["Space", "LButton"] ...
+Global DPadBinds := {Up: [], Down: [], Left: [], Right: []}
+Global lastButtonState := {}  ; "A" -> 0/1
+Global lastDpadState := "None"
 
 VarSetCapacity(AndMask, 128, 0xFF)
 VarSetCapacity(XorMask, 128, 0x00)
@@ -410,6 +427,14 @@ Global LT_D := ParseDigital(ReadIni(configFile, "LT_D", "DigitalBinds"))
 Global RT_A := ParseAnalog(ReadIni(configFile, "RT_A"))
 Global RT_D := ParseDigital(ReadIni(configFile, "RT_D", "DigitalBinds"))
 
+; --- [DigitalButtons]: non-axis controller buttons ---
+For _, btn in ["A", "B", "X", "Y", "LB", "LS", "RB", "RS", "Start", "Back", "Xbox"] {
+    ButtonBinds[btn] := ParseKeyList(ReadIni(configFile, btn, "DigitalButtons"))
+    lastButtonState[btn] := 0
+}
+For _, dir in ["Up", "Down", "Left", "Right"]
+    DPadBinds[dir] := ParseKeyList(ReadIni(configFile, "DPad" . dir, "DigitalButtons"))
+
 if (exeName.Length() == 0) {
     AppState.RunAlways := true
     EnableMouseLock := 0 
@@ -479,6 +504,7 @@ CoreLoop:
         UpdateAHIMousePhysics()
 
     UpdateAllVirtualAxes()
+    UpdateDigitalButtons()
     
     if (AHIMouseTranslation)
         ApplyAHISpringReturn()
@@ -570,6 +596,47 @@ UpdateAllVirtualAxes() {
     CommitVirtualPressure("RY", true, ry)
     CommitVirtualPressure("LT", false, lt)
     CommitVirtualPressure("RT", false, rt)
+}
+
+IsAnyKeyDown(keys) {
+    global AHI_DigiState
+    for _, k in keys {
+        if (GetKeyState(k, "P") || AHI_DigiState[k])
+            return true
+    }
+    return false
+}
+
+UpdateDigitalButtons() {
+    global ButtonBinds, DPadBinds, lastButtonState, lastDpadState, pad, ControllerActive
+
+    for name, keys in ButtonBinds {
+        if (keys.Length() == 0)
+            continue
+        state := IsAnyKeyDown(keys) ? 1 : 0
+        if (state != lastButtonState[name]) {
+            lastButtonState[name] := state
+            if (ControllerActive)
+                pad.Buttons[name].SetState(state)
+        }
+    }
+
+    up := IsAnyKeyDown(DPadBinds.Up), down := IsAnyKeyDown(DPadBinds.Down)
+    left := IsAnyKeyDown(DPadBinds.Left), right := IsAnyKeyDown(DPadBinds.Right)
+    if (up && down)
+        up := 0, down := 0       ; opposing directions cancel out
+    if (left && right)
+        left := 0, right := 0
+
+    dir := (up ? "Up" : down ? "Down" : "") . (right ? "Right" : left ? "Left" : "")
+    if (dir == "")
+        dir := "None"
+
+    if (dir != lastDpadState) {
+        lastDpadState := dir
+        if (ControllerActive)
+            pad.Dpad.SetState(dir)
+    }
 }
 
 ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
@@ -823,15 +890,23 @@ DeactivateMouseTranslation() {
 }
 ActivateController() {
     global ControllerActive, lastAxisState, pad
+    global lastButtonState, lastDpadState
     ControllerActive := true
     for axis, val in lastAxisState
         pad.Axes[axis].SetState(val)
+    for btn, val in lastButtonState
+        pad.Buttons[btn].SetState(val)
+    pad.Dpad.SetState(lastDpadState)
 }
 DeactivateController() {
     global ControllerActive, lastAxisState, pad
+    global lastButtonState
     ControllerActive := false
     for axis in lastAxisState
         pad.Axes[axis].SetState(0)
+    for btn in lastButtonState
+        pad.Buttons[btn].SetState(0)
+    pad.Dpad.SetState("None")
 }
 
 ; === DYNAMIC INTERCEPTION HANDLERS ===
@@ -892,7 +967,7 @@ ReadIni(file, key, section := "AnalogBinds") {
 }
 
 FocusLost() {
-    global lastAxisState, pad, SteerKey, AHI_DigiState, AHIMouse
+    global lastAxisState, pad, SteerKey, AHI_DigiState, AHIMouse, lastButtonState, lastDpadState
     Click, Middle Up
 
     AHIMouse.DeltaX := 0, AHIMouse.DeltaY := 0, AHIMouse.StickX := 0, AHIMouse.StickY := 0, AHIMouse.LastTick := 0
@@ -902,6 +977,16 @@ FocusLost() {
             lastAxisState[axis] := 0
             pad.Axes[axis].SetState(0)
         }
+    }
+    for btn, val in lastButtonState {
+        if (val != 0) {
+            lastButtonState[btn] := 0
+            pad.Buttons[btn].SetState(0)
+        }
+    }
+    if (lastDpadState != "None") {
+        lastDpadState := "None"
+        pad.Dpad.SetState("None")
     }
     AHI_DigiState := {}
     SteerKey.Down := false
@@ -966,6 +1051,21 @@ ParseDigital(iniStr) {
                 k := SubStr(k, 2)
             arr.Push([k, Trim(parts[2]) * 2.55])
         }
+    }
+    return arr
+}
+
+ParseKeyList(iniStr) {
+    arr := []
+    if (iniStr == "" || iniStr == "ERROR")
+        return arr
+    Loop, Parse, iniStr, `,
+    {
+        k := Trim(A_LoopField)
+        if (SubStr(k, 1, 1) == "$")
+            k := SubStr(k, 2)
+        if (k != "")
+            arr.Push(k)
     }
     return arr
 }
