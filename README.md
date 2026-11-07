@@ -1,4 +1,4 @@
-Wooting/XInput Passthrough/Mouse Steering/Digital to XInput. Quick and easy profile switching through Alt+Y or by holding Ctrl+Shift on script start.
+Wooting/XInput Passthrough/Mouse Steering/Digital to XInput. Quick and easy profile switching through Win+T or by holding Ctrl+Shift on script start.
 
 - Requires installing ViGEmBus: https://github.com/nefarius/ViGEmBus/releases
 - Optionally requires Interception driver, otherwise set EnableAHI in .Settings.ini to 0. Install for games that need raw input suppression for mouse rebinds that can't be done through Autohotkey alone. Do mind the device add limit bug when using Interception: (re-)plugging in too many mice or keyboards may make new devices not work until system reboot: https://github.com/oblitum/Interception/releases
