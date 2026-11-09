@@ -1,7 +1,8 @@
 ; Requires ViGEmBus to be installed, + bundled scripts and DLLs in \Lib
 ; If Interception is not installed, set EnableAHI=0 in $MapperConfigs\.Settings.ini
 ; .Settings.ini [GlobalSettings]: configAliases, exeMatches, EnableAHI, WootingEnabled, ExternalXInputEnabled,
-;   DebugMode, RelaunchHotkey (default #t), ExitHotkey (default #u; blank disables either hotkey)
+;   DebugMode, AHITrace (1 = log every intercepted key event to $MapperConfigs\.ahi_trace.log),
+;   RelaunchHotkey (default #t), ExitHotkey (default #u; blank disables either hotkey)
 ;
 ; === Conditional INI blocks ===
 ; An .ini with NO [[[ ]]] header behaves exactly as before (one profile; [Settings] exeName is used).
@@ -161,9 +162,10 @@ IniRead, WootingEnabled, %settingsFile%, GlobalSettings, WootingEnabled, 1
 IniRead, ExternalXInputEnabled, %settingsFile%, GlobalSettings, ExternalXInputEnabled, 1
 IniRead, RelaunchHotkey, %settingsFile%, GlobalSettings, RelaunchHotkey, #t
 IniRead, ExitHotkey, %settingsFile%, GlobalSettings, ExitHotkey, #u
+IniRead, AHITrace, %settingsFile%, GlobalSettings, AHITrace, 0
 
 GlobalInject := "Global EnableAHI := " . (EnableAHI ? 1 : 0) . "`nGlobal WootingEnabled := " . (WootingEnabled ? 1 : 0)
-GlobalInject .= "`nGlobal ExternalXInputEnabled := " . (ExternalXInputEnabled ? 1 : 0)
+GlobalInject .= "`nGlobal ExternalXInputEnabled := " . (ExternalXInputEnabled ? 1 : 0) . "`nGlobal AHITrace := " . (AHITrace ? 1 : 0)
 GlobalInject .= "`nGlobal RelaunchHotkey := " . AhkQ(RelaunchHotkey) . "`nGlobal ExitHotkey := " . AhkQ(ExitHotkey) . "`n"
 
 IncludeDirectives := "#Include <AHK-ViGEm-Bus_v1>`n"
@@ -659,6 +661,7 @@ ExpandAhiShorthand(t) {
 #UseHook
 #InputLevel 100
 #HotkeyInterval 0
+#MaxThreads 255
 SetBatchLines, -1
 CoordMode, Mouse, Screen
 
@@ -1049,7 +1052,7 @@ UpdateAllVirtualAxes() {
 IsAnyKeyDown(keys) {
     global AHI_DigiState
     for _, k in keys {
-        if (GetKeyState(k, "P") || AHI_DigiState[k])
+        if (KeyIsDown(k))
             return true
     }
     return false
@@ -1223,7 +1226,7 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
     DigiOverride[axis] := false
     
     for _, pair in dArray {
-        if (GetKeyState(pair[1], "P") || AHI_DigiState[pair[1]]) {
+        if (KeyIsDown(pair[1])) {
             pressure := pair[2]
             if (isStick && axis == MouseSteeringAxisX && LX_D_MovesMouse) {
                 signX := MouseSteeringAxisX_Mult < 0 ? -1 : 1
@@ -1402,16 +1405,22 @@ DeactivateController() {
 ; === DYNAMIC INTERCEPTION HANDLERS ===
 ; The handler for a key is looked up per event from the ACTIVE block. If the active block has no handler
 ; (and doesn't $-swallow the key), the event is passed through untouched.
+; AHI_DigiState[name] is the tracked physical state of every intercepted key, updated on every event (swallowed or not).
 ; OSDown[name]: the OS has seen this key/button go down and not yet up. A suppressed release must still
 ; reach the OS in that case (key was already held when suppression began), or it would stay stuck.
 Core_DynamicKeyHandler(keyName, sc, kId, state) {
-    global ahi, AHI_DigiState, OSDown
-    if (Core_Dispatch(keyName, fn)) {
-        AHI_DigiState[keyName] := state
+    global ahi, AHI_DigiState, OSDown, AHITrace
+    Critical, On
+    AHI_DigiState[keyName] := state
+    handled := Core_Dispatch(keyName, fn)
+    if (AHITrace)
+        Core_Trace("K", keyName, kId, state, handled)
+    if (handled) {
         if (!state && OSDown[keyName]) {
             OSDown[keyName] := false
             ahi.SendKeyEvent(kId, sc, 0)
         }
+        Critical, Off
         if (fn)
             fn.Call(state)
     } else {
@@ -1421,13 +1430,18 @@ Core_DynamicKeyHandler(keyName, sc, kId, state) {
 }
 
 Core_DynamicMouseBtnHandler(btnName, btnId, mId, state) {
-    global ahi, AHI_DigiState, OSDown
-    if (Core_Dispatch(btnName, fn)) {
-        AHI_DigiState[btnName] := state
+    global ahi, AHI_DigiState, OSDown, AHITrace
+    Critical, On
+    AHI_DigiState[btnName] := state
+    handled := Core_Dispatch(btnName, fn)
+    if (AHITrace)
+        Core_Trace("B", btnName, mId, state, handled)
+    if (handled) {
         if (!state && OSDown[btnName]) {
             OSDown[btnName] := false
             ahi.SendMouseButtonEvent(mId, btnId, 0)
         }
+        Critical, Off
         if (fn)
             fn.Call(state)
     } else {
@@ -1444,6 +1458,18 @@ Core_DynamicMouseWheelHandler(btnName, btnId, mId, direction) {
     } else {
         ahi.SendMouseButtonEvent(mId, btnId, direction)
     }
+}
+
+Core_Trace(kind, name, dev, state, handled) {
+    global ScriptDir
+    FileAppend, % A_TickCount . "," . kind . "," . name . "," . dev . "," . state . "," . handled . "`n", %ScriptDir%\$MapperConfigs\.ahi_trace.log
+}
+
+; Down state of a key/button. For intercepted ones AHI_DigiState is the only truth: AHK's own physical state is
+; not updated while AHI blocks the events, so it can be left stale.
+KeyIsDown(k) {
+    global AHI_DigiState
+    return AHI_DigiState.HasKey(k) ? AHI_DigiState[k] : GetKeyState(k, "P")
 }
 
 ; Returns 1 if the active block handles keyName (fn = handler function, or empty for a $-swallow), else 0
@@ -1507,26 +1533,28 @@ Core_SyncAHI() {
 }
 
 Core_AHISub(tag, name) {
-    global ahi, AHIKbd, AHIMice, MouseButtons, OSDown
+    global ahi, AHIKbd, AHIMice, MouseButtons, OSDown, AHI_DigiState
     kind := SubStr(tag, 1, 1)
     if (kind == "K") {
         sc := GetKeySC(name)
         if (!sc)
             return
+        down := GetKeyState(name, "P") ? 1 : 0
         for _, id in AHIKbd
-            ahi.SubscribeKey(id, sc, true, Func("Core_DynamicKeyHandler").Bind(name, sc, id))
-        if (GetKeyState(name, "P"))
-            OSDown[name] := true
+            ahi.SubscribeKey(id, sc, true, Func("Core_DynamicKeyHandler").Bind(name, sc, id), true)
+        AHI_DigiState[name] := down
+        OSDown[name] := down
     } else if (kind == "B") {
         btnId := MouseButtons[name]
+        down := GetKeyState(name, "P") ? 1 : 0
         for _, id in AHIMice
-            ahi.SubscribeMouseButton(id, btnId, true, Func("Core_DynamicMouseBtnHandler").Bind(name, btnId, id))
-        if (GetKeyState(name, "P"))
-            OSDown[name] := true
+            ahi.SubscribeMouseButton(id, btnId, true, Func("Core_DynamicMouseBtnHandler").Bind(name, btnId, id), true)
+        AHI_DigiState[name] := down
+        OSDown[name] := down
     } else if (kind == "W") {
         btnId := (name == "Wheel") ? 5 : 6
         for _, id in AHIMice
-            ahi.SubscribeMouseButton(id, btnId, true, Func("Core_DynamicMouseWheelHandler").Bind(name, btnId, id))
+            ahi.SubscribeMouseButton(id, btnId, true, Func("Core_DynamicMouseWheelHandler").Bind(name, btnId, id), true)
     } else {
         for _, id in AHIMice
             ahi.SubscribeMouseMoveRelative(id, true, Func("Core_ahiOnMouseMoveRelative").Bind(id))
@@ -1534,15 +1562,19 @@ Core_AHISub(tag, name) {
 }
 
 Core_AHIUnsub(tag, name) {
-    global ahi, AHIKbd, AHIMice, MouseButtons
+    global ahi, AHIKbd, AHIMice, MouseButtons, OSDown, AHI_DigiState
     kind := SubStr(tag, 1, 1)
     if (kind == "K") {
         sc := GetKeySC(name)
         for _, id in AHIKbd
             ahi.UnsubscribeKey(id, sc)
+        AHI_DigiState.Delete(name)
+        OSDown.Delete(name)
     } else if (kind == "B") {
         for _, id in AHIMice
             ahi.UnsubscribeMouseButton(id, MouseButtons[name])
+        AHI_DigiState.Delete(name)
+        OSDown.Delete(name)
     } else if (kind == "W") {
         btnId := (name == "Wheel") ? 5 : 6
         for _, id in AHIMice
@@ -1634,6 +1666,7 @@ Core_SelectBlock() {
     }
     Critical, Off
     if (newIdx > 0) {
+        ResetControllerState()
         if (prevGroup && ActiveGroupIdx != prevGroup) {
             SteerKey.Down := StartupMouseSteering
             AHIMouseTranslation := StartupMouseTranslation
@@ -1855,28 +1888,28 @@ ReadExternalGamepads() {
     }
 }
 
-FocusLost() {
-    global lastAxisState, pad, SteerKey, AHI_DigiState, AHIMouse, lastButtonState, lastDpadState, PadDirty
+; Lifts every virtual axis, button and the dpad, and clears the mouse-translation stick. Cached states are zeroed,
+; so inputs that are still held are re-applied on the next tick.
+ResetControllerState() {
+    global lastAxisState, lastButtonState, lastDpadState, pad, PadDirty, AHIMouse
     AHIMouse.DeltaX := 0, AHIMouse.DeltaY := 0, AHIMouse.StickX := 0, AHIMouse.StickY := 0, AHIMouse.LastTick := 0
-
     for axis in lastAxisState {
-        if (lastAxisState[axis] != 0) {
-            lastAxisState[axis] := 0
-            pad.Axes[axis].SetState(0)
-        }
+        lastAxisState[axis] := 0
+        pad.Axes[axis].SetState(0)
     }
-    for btn, val in lastButtonState {
-        if (val != 0) {
-            lastButtonState[btn] := 0
-            pad.Buttons[btn].SetState(0)
-        }
+    for btn in lastButtonState {
+        lastButtonState[btn] := 0
+        pad.Buttons[btn].SetState(0)
     }
-    if (lastDpadState != "None") {
-        lastDpadState := "None"
-        pad.Dpad.SetState("None")
-    }
+    lastDpadState := "None"
+    pad.Dpad.SetState("None")
     pad.SendReport()
     PadDirty := false
+}
+
+FocusLost() {
+    global SteerKey, AHI_DigiState
+    ResetControllerState()
     AHI_DigiState := {}
     SteerKey.Down := false
     CleanupMouseLockAndHide()
@@ -2041,4 +2074,4 @@ Reload_Launcher_with_Selection:
 Exit_Script:
     ExitApp
 [CORE_LOGIC_END]
-*/
+*/
