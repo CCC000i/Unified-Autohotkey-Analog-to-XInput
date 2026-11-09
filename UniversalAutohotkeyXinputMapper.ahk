@@ -142,6 +142,7 @@ if (matchedConfig == "") {
 ; === Dynamic Config Load ===
 configFile := settingsDir . "\" . matchedConfig . ".ini"
 FileRead, FileContent, %configFile%
+FileContent := ToCRLF(FileContent)
 if (ErrorLevel) {
     MsgBox, 16, Error, Config INI could not be read.
     FileDelete, %sessionFile%
@@ -262,6 +263,7 @@ ParseExeMatches(iniStr) {
 ; True if the .ini has a [[[exe]]] header whose exe is currently running (used only for the startup prompt default)
 IniHasRunningExe(file) {
     FileRead, txt, %file%
+    txt := ToCRLF(txt)
     Pos := 1
     while (Pos := RegExMatch(txt, "mO)^\[\[\[(.+?)\]\]\][ \t\r]*$", M, Pos)) {
         hdr := M.Value(1)
@@ -625,7 +627,13 @@ ScopeContextDirectives(txt, base) {
     return out
 }
 
+; AHK's multiline ^ and $ only recognise CRLF line breaks, so text fed to m) regexes must be CRLF
+ToCRLF(s) {
+    return StrReplace(StrReplace(s, "`r`n", "`n"), "`n", "`r`n")
+}
+
 ExpandAhiShorthand(t) {
+    t := ToCRLF(t)
     t := RegExReplace(t, "mi)^[ \t]*ahiS_(H?Wheel)[ \t]*::[ \t]*(\w+),(\w+)(?:,(\d+))?[ \t\r]*(?:;.*)?$", "ahiS_$1(direction) {`n    if (direction == 1) {`n        <WHEEL:$2:$4>`n    } else if (direction == -1) {`n        <WHEEL:$3:$4>`n    }`n}")
     t := RegExReplace(t, "i)[ \t]*<WHEEL:return:[^>]*>", "")
     t := RegExReplace(t, "i)<WHEEL:(\w+):>", "Send, {$1 down}`n        Sleep, 25`n        Send, {$1 up}")
@@ -635,7 +643,7 @@ ExpandAhiShorthand(t) {
     t := RegExReplace(t, "mi)^[ \t]*ahiS_(\w+)[ \t]*::[ \t]*ProcessController[ \t\r]*(?:;.*)?$", "ahiS_$1(state) {`n    if state {`n        ActivateController()`n    }`n    else {`n        DeactivateController()`n    }`n}")
     t := RegExReplace(t, "mi)^[ \t]*ahiS_(\w+)[ \t]*::[ \t]*(?:return)?[ \t\r]*(?:;.*)?$", "ahiS_$1(state) {`n}")
     t := RegExReplace(t, "mi)^[ \t]*ahiS_(\w+)[ \t]*::[ \t]*([^ \t\r;]+)[ \t\r]*(?:;.*)?$", "ahiS_$1(state) {`n    if state {`n        Send, {$2 down}`n    }`n    else {`n        Send, {$2 up}`n    }`n}")
-    return t
+    return StrReplace(t, "`r`n", "`n")
 }
 
 ; ==========================================
@@ -808,6 +816,9 @@ AHIMouseTranslation := StartupMouseTranslation
 ; ActiveBlockIdx stays 0 here: the first CoreLoop tick selects the block and runs its autoexec
 
 ; === Libraries & Device Initialization ===
+; AHI subscriptions are dynamic: only the keys/buttons the ACTIVE block handles are intercepted (see Core_SyncAHI).
+; While no block is active nothing is intercepted at all.
+Global AHISubs := {}, AHIKbd := [], AHIMice := [], OSDown := {}
 if (EnableAHI) {
     Global ahi := new AutoHotInterception()
     MouseButtons := { "LButton": 0, "RButton": 1, "MButton": 2, "XButton1": 3, "XButton2": 4 }
@@ -832,36 +843,11 @@ if (EnableAHI) {
         }
     }
 
-    needMouseMove := false
-    for _, b in Blocks {
-        if (b.UsesTranslation) {
-            needMouseMove := true
-            break
-        }
-    }
-
     for _, device in ahi.GetDeviceList() {
-        id := device.Id
-        if (device.isMouse) {
-            if (needMouseMove)
-                ahi.SubscribeMouseMoveRelative(id, true, Func("Core_ahiOnMouseMoveRelative").Bind(id))
-            for btnName, btnId in MouseButtons {
-                if (Core_HasAnyHandler(btnName))
-                    ahi.SubscribeMouseButton(id, btnId, true, Func("Core_DynamicMouseBtnHandler").Bind(btnName, btnId, id))
-            }
-            if (Core_HasAnyHandler("Wheel"))
-                ahi.SubscribeMouseButton(id, 5, true, Func("Core_DynamicMouseWheelHandler").Bind("Wheel", 5, id))
-            if (Core_HasAnyHandler("HWheel"))
-                ahi.SubscribeMouseButton(id, 6, true, Func("Core_DynamicMouseWheelHandler").Bind("HWheel", 6, id))
-        } else {
-            for _, keyName in KeysToScan {
-                if (!Core_HasAnyHandler(keyName))
-                    continue
-                sc := GetKeySC(keyName)
-                if (sc)
-                    ahi.SubscribeKey(id, sc, true, Func("Core_DynamicKeyHandler").Bind(keyName, sc, id))
-            }
-        }
+        if (device.isMouse)
+            AHIMice.Push(device.Id)
+        else
+            AHIKbd.Push(device.Id)
     }
 }
 
@@ -1416,24 +1402,36 @@ DeactivateController() {
 ; === DYNAMIC INTERCEPTION HANDLERS ===
 ; The handler for a key is looked up per event from the ACTIVE block. If the active block has no handler
 ; (and doesn't $-swallow the key), the event is passed through untouched.
+; OSDown[name]: the OS has seen this key/button go down and not yet up. A suppressed release must still
+; reach the OS in that case (key was already held when suppression began), or it would stay stuck.
 Core_DynamicKeyHandler(keyName, sc, kId, state) {
-    global ahi, AHI_DigiState
+    global ahi, AHI_DigiState, OSDown
     if (Core_Dispatch(keyName, fn)) {
         AHI_DigiState[keyName] := state
+        if (!state && OSDown[keyName]) {
+            OSDown[keyName] := false
+            ahi.SendKeyEvent(kId, sc, 0)
+        }
         if (fn)
             fn.Call(state)
     } else {
+        OSDown[keyName] := state ? true : false
         ahi.SendKeyEvent(kId, sc, state)
     }
 }
 
 Core_DynamicMouseBtnHandler(btnName, btnId, mId, state) {
-    global ahi, AHI_DigiState
+    global ahi, AHI_DigiState, OSDown
     if (Core_Dispatch(btnName, fn)) {
         AHI_DigiState[btnName] := state
+        if (!state && OSDown[btnName]) {
+            OSDown[btnName] := false
+            ahi.SendMouseButtonEvent(mId, btnId, 0)
+        }
         if (fn)
             fn.Call(state)
     } else {
+        OSDown[btnName] := state ? true : false
         ahi.SendMouseButtonEvent(mId, btnId, state)
     }
 }
@@ -1468,18 +1466,91 @@ Core_Dispatch(keyName, ByRef fn) {
     return blk.Swallow.HasKey(keyName) ? 1 : 0
 }
 
-; True if ANY block handles/swallows keyName (decides what gets subscribed at startup)
-Core_HasAnyHandler(keyName) {
-    global Blocks, PrependSubOrigin
-    if (PrependSubOrigin && Func("O" . PrependSubOrigin . "_ahiS_" . keyName))
-        return true
-    for _, blk in Blocks {
-        if (blk.Swallow.HasKey(keyName))
-            return true
-        if (blk.SubOrigin && Func("O" . blk.SubOrigin . "_ahiS_" . keyName))
-            return true
+; Makes the set of AHI subscriptions match what the active block (plus Prepend) handles. Called on every block change.
+Core_SyncAHI() {
+    global ahi, EnableAHI, Blocks, ActiveBlockIdx, AHISubs, KeysToScan, MouseButtons
+    if (!EnableAHI || !IsObject(ahi))
+        return
+    want := {}
+    if (ActiveBlockIdx > 0) {
+        fn := ""
+        for _, kn in KeysToScan {
+            if (Core_Dispatch(kn, fn))
+                want["K:" . kn] := kn
+        }
+        for bn in MouseButtons {
+            if (Core_Dispatch(bn, fn))
+                want["B:" . bn] := bn
+        }
+        if (Core_Dispatch("Wheel", fn))
+            want["W:Wheel"] := "Wheel"
+        if (Core_Dispatch("HWheel", fn))
+            want["W:HWheel"] := "HWheel"
+        if (Blocks[ActiveBlockIdx].UsesTranslation)
+            want["M:Move"] := "Move"
     }
-    return false
+    drop := []
+    for tag, name in AHISubs {
+        if (!want.HasKey(tag))
+            drop.Push(tag)
+    }
+    for _, tag in drop {
+        Core_AHIUnsub(tag, AHISubs[tag])
+        AHISubs.Delete(tag)
+    }
+    for tag, name in want {
+        if (AHISubs.HasKey(tag))
+            continue
+        Core_AHISub(tag, name)
+        AHISubs[tag] := name
+    }
+}
+
+Core_AHISub(tag, name) {
+    global ahi, AHIKbd, AHIMice, MouseButtons, OSDown
+    kind := SubStr(tag, 1, 1)
+    if (kind == "K") {
+        sc := GetKeySC(name)
+        if (!sc)
+            return
+        for _, id in AHIKbd
+            ahi.SubscribeKey(id, sc, true, Func("Core_DynamicKeyHandler").Bind(name, sc, id))
+        if (GetKeyState(name, "P"))
+            OSDown[name] := true
+    } else if (kind == "B") {
+        btnId := MouseButtons[name]
+        for _, id in AHIMice
+            ahi.SubscribeMouseButton(id, btnId, true, Func("Core_DynamicMouseBtnHandler").Bind(name, btnId, id))
+        if (GetKeyState(name, "P"))
+            OSDown[name] := true
+    } else if (kind == "W") {
+        btnId := (name == "Wheel") ? 5 : 6
+        for _, id in AHIMice
+            ahi.SubscribeMouseButton(id, btnId, true, Func("Core_DynamicMouseWheelHandler").Bind(name, btnId, id))
+    } else {
+        for _, id in AHIMice
+            ahi.SubscribeMouseMoveRelative(id, true, Func("Core_ahiOnMouseMoveRelative").Bind(id))
+    }
+}
+
+Core_AHIUnsub(tag, name) {
+    global ahi, AHIKbd, AHIMice, MouseButtons
+    kind := SubStr(tag, 1, 1)
+    if (kind == "K") {
+        sc := GetKeySC(name)
+        for _, id in AHIKbd
+            ahi.UnsubscribeKey(id, sc)
+    } else if (kind == "B") {
+        for _, id in AHIMice
+            ahi.UnsubscribeMouseButton(id, MouseButtons[name])
+    } else if (kind == "W") {
+        btnId := (name == "Wheel") ? 5 : 6
+        for _, id in AHIMice
+            ahi.UnsubscribeMouseButton(id, btnId)
+    } else {
+        for _, id in AHIMice
+            ahi.UnsubscribeMouseMoveRelative(id)
+    }
 }
 
 ; === BLOCK SELECTION & PROFILE LOADING ===
@@ -1573,6 +1644,7 @@ Core_SelectBlock() {
         Core_RunAutoexec(PrependAutoOrigin)
         Core_RunAutoexec(blk.AutoOrigin)
     }
+    Core_SyncAHI()
 }
 
 ; Each distinct [CustomAutoexecute] text runs once, in its own thread, the first time a block using it activates
@@ -1969,4 +2041,4 @@ Reload_Launcher_with_Selection:
 Exit_Script:
     ExitApp
 [CORE_LOGIC_END]
-*/
+*/
