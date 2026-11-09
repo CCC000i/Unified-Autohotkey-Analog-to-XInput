@@ -28,6 +28,7 @@ class ViGEmWrapper {
 ; Base class for ViGEm "Targets" (Controller types - eg xb360 / ds4) to inherit from
 class ViGEmTarget {
     target := 0
+    AutoSend := true
     helperClass := ""
     controllerClass := ""
 
@@ -45,6 +46,11 @@ class ViGEmTarget {
         this.Instance.SendReport()
     }
     
+    Flush(){
+        if (this.AutoSend)
+            this.Instance.SendReport()
+    }
+    
     SubscribeFeedback(callback){
         this.Instance.SubscribeFeedback(callback)
     }
@@ -58,7 +64,7 @@ class ViGEmTarget {
         
         SetState(state){
             this._Parent.Instance.SetButtonState(this._Id, state)
-            this._Parent.SendReport()
+            this._Parent.Flush()
             return this._Parent
         }
     }
@@ -98,7 +104,7 @@ class ViGEmDS4 extends ViGEmTarget {
         
         SetState(state){
             this._Parent.Instance.SetSpecialButtonState(this._Id, state)
-            this._Parent.SendReport()
+            this._Parent.Flush()
             return this._Parent
         }
     }
@@ -111,7 +117,7 @@ class ViGEmDS4 extends ViGEmTarget {
         
         SetState(state){
             this._Parent.Instance.SetAxisState(this._Id, Round(state))
-            this._Parent.SendReport()
+            this._Parent.Flush()
             return this._Parent
         }
     }
@@ -124,7 +130,7 @@ class ViGEmDS4 extends ViGEmTarget {
         SetState(state){
             static dPadDirections := {None: 8, Up: 0, UpRight: 1, Right: 2, DownRight: 3, Down: 4, DownLeft: 5, Left: 6, UpLeft: 7}
             this._Parent.Instance.SetDpadState(dPadDirections[state])
-            this._Parent.SendReport()
+            this._Parent.Flush()
             return this._Parent
         }
     }
@@ -162,7 +168,7 @@ class ViGEmXb360 extends ViGEmTarget {
             ; Directly rounds and passes the input state to the assembly instance.
             ; Allows 0 to 255 for Triggers (IDs 0 & 1) and -32768 to 32767 for Sticks (IDs 2-5).
             this._Parent.Instance.SetAxisState(this._Id, Round(state))
-            this._Parent.SendReport()
+            this._Parent.Flush()
             return this._Parent
         }
     }
@@ -190,7 +196,7 @@ class ViGEmXb360 extends ViGEmTarget {
             }
             
             if (changed) {
-                this._Parent.SendReport()
+                this._Parent.Flush()
             }
             
             return this._Parent

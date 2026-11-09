@@ -60,6 +60,10 @@ class AutoHotInterception {
 		}
 	}
 
+	Dispose() {
+		try this.Instance.Dispose()
+	}
+
 	GetInstance() {
 		return this.Instance
 	}

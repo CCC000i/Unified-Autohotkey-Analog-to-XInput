@@ -19,13 +19,14 @@ class SimpleWooting_v1 {
             ; Initialization failed. Free the library without calling uninitialise.
             DllCall("FreeLibrary", "Ptr", this.hModule)
             this.hModule := 0
+            MsgBox, 16, Wooting, wooting_analog_initialise failed.
             return false
         }
         return true
     }
 
     R(hidCode) {
-        return this.hModule ? Round(DllCall("wooting_analog_sdk\wooting_analog_read_analog", "UShort", hidCode, "Cdecl Float") * 255) : 0
+        return this.hModule ? Max(0, Round(DllCall("wooting_analog_sdk\wooting_analog_read_analog", "UShort", hidCode, "Cdecl Float") * 255)) : 0
     }
 
 	RP(ahkCode) {
