@@ -1,6 +1,8 @@
 ; Requires ViGEmBus to be installed, + bundled scripts and DLLs in \Lib
 ; .Settings.ini [GlobalSettings]: configAliases, exeMatches, WootingEnabled, ExternalXInputEnabled,
 ;   DebugMode, AutoHotInterceptionEnabled (default 1; only matters when an ahiS_ function exists),
+;   AhiWootingBypass (default 1), AhiBypassThreshold (1-255, default 100), AhiBypassGraceMs (default 40):
+;   see "Keyboard -> controller bypass" in the AutoHotInterception notes below,
 ;   RelaunchHotkey (default #t), ExitHotkey (default #u; blank disables either hotkey)
 ;
 ; === Conditional INI blocks ===
@@ -47,9 +49,13 @@
 ; MButton XButton1 XButton2, scXXX / vkXX, plus these spellings for punctuation: Comma Period Dot Semicolon Slash
 ; Backslash Minus Equals Apostrophe Backtick LeftBracket RightBracket. Joystick is not supported; for the wheel see below.
 ; Keys are resolved by scan code, so letters follow the active keyboard layout. A hidden key is invisible to hotkeys and
-; GetKeyState(,"P"), but NOT to the controller mapping: DigitalButtons / DPad / axis key binds still see the physical key
-; (ahiS_w {} does not stop DPadUp=W). Needs AutoHotInterception_v1 + the Interception driver; the library is only loaded when an ahiS_
+; GetKeyState(,"P"), but the mapper's own binds (A=space, dpad, axis digital binds) still see it, so the same key can
+; drive a pad button AND run its ahiS_ function. Needs AutoHotInterception_v1 + the Interception driver; the library is only loaded when an ahiS_
 ; function exists. The same physical key in Prepend and a block: Prepend wins (like hotkeys).
+; Keyboard -> controller bypass: a key AHI hides reaches the pad binds only through AHI's callbacks. On a Wooting keyboard
+; the pad can also read such a key straight from the Wooting SDK (AHI cannot hide that). It steps in only when the key has
+; been pressed deeper than AhiBypassThreshold for AhiBypassGraceMs without AHI reporting it, so with a healthy AHI nothing
+; changes (actuation point and release timing stay AHI's). Set AhiWootingBypass=0 to turn it off.
 ; Mouse wheel: ahiS_wheel(up) and ahiS_hwheel(up) run once per wheel notch (there is no release). up = 1 for wheel up / tilt
 ; right, 0 for wheel down / tilt left; omit the parameter if you don't care. The notch is swallowed while the block is active.
 ;   ahiS_wheel(up) {
@@ -206,12 +212,25 @@ IniRead, ExternalXInputEnabled, %settingsFile%, GlobalSettings, ExternalXInputEn
 IniRead, RelaunchHotkey, %settingsFile%, GlobalSettings, RelaunchHotkey, #t
 IniRead, ExitHotkey, %settingsFile%, GlobalSettings, ExitHotkey, #u
 IniRead, AhiEnabled, %settingsFile%, GlobalSettings, AutoHotInterceptionEnabled, 1
+IniRead, AhiBypass, %settingsFile%, GlobalSettings, AhiWootingBypass, 1
+IniRead, AhiBypassThreshold, %settingsFile%, GlobalSettings, AhiBypassThreshold, 100
+IniRead, AhiBypassGrace, %settingsFile%, GlobalSettings, AhiBypassGraceMs, 40
+if AhiBypass is not integer
+    AhiBypass := 1
+if AhiBypassThreshold is not integer
+    AhiBypassThreshold := 100
+if AhiBypassGrace is not integer
+    AhiBypassGrace := 40
+AhiBypass := AhiBypass ? 1 : 0
+AhiBypassThreshold := Max(1, Min(255, AhiBypassThreshold))
+AhiBypassGrace := Max(0, AhiBypassGrace)
 AhiUsed := (AhiEnabled && Compiled.AhiCount > 0) ? 1 : 0
 
 GlobalInject := "Global WootingEnabled := " . (WootingEnabled ? 1 : 0)
 GlobalInject .= "`nGlobal ExternalXInputEnabled := " . (ExternalXInputEnabled ? 1 : 0)
 GlobalInject .= "`nGlobal RelaunchHotkey := " . AhkQ(RelaunchHotkey) . "`nGlobal ExitHotkey := " . AhkQ(ExitHotkey) . "`n"
 GlobalInject .= "Global AhiEnabled := " . AhiUsed . ", AhiDebug := " . (DebugMode ? 1 : 0) . "`n"
+GlobalInject .= "Global AhiBypass := " . AhiBypass . ", AhiBypassThreshold := " . AhiBypassThreshold . ", AhiBypassGrace := " . AhiBypassGrace . "`n"
 
 IncludeDirectives := "#Include <AHK-ViGEm-Bus_v1>`n"
 if (WootingEnabled)
@@ -809,8 +828,10 @@ Global DigiOverride := {}
 ; --- AutoHotInterception (AhiEnabled is injected by the launcher: 1 only when ahiS_ functions exist) ---
 Global AHI := "", AhiOn := false, AhiKeyboards := [], AhiMice := [], AhiByOrigin := {}, AhiAll := []
 Global AhiOwner := {}, AhiDirty := false, AhiLastEvt := 0, WheelStates := []
-Global AhiKeyCache := {}, AhiKeySeen := {}
-Global AhiPhys := {}, AhiPhysN := {}   ; physical key state seen by AHI (hk -> 1, slotKey -> count), read by Core_KeyDown
+Global CLLast := 0, WinCheckLast := 0
+Global AhiHeldKeys := {}, AhiKeyCount := {}   ; physical state of keys hidden by AHI (see KeyPhysDown)
+Global AhiPoolMin := 0, AhiWorkers := 0       ; .NET thread-pool minimum asked for / AHI worker tasks spawned so far (see Core_AhiPoolEnsure)
+Global AhiBypassState := {}                   ; per hidden key: 0/absent = below threshold, -1 = AHI owns the press, tick = timing (see Core_AhiBypass)
 
 Global SPI_SETCURSORS := 0x57, SWP_NOSIZE_NOZORDER_NOACTIVATE := 0x15, IMAGE_CURSOR := 2
 Global CONST := { MULT_POS: 128.49803, MULT_NEG: 128.50196, READ_MULT: 0.00778198 }
@@ -940,6 +961,10 @@ if (RelaunchHotkey != "")
 if (ExitHotkey != "")
     RegisterHotkey(ExitHotkey, "Exit_Script")
 
+; CoreLoop re-arms every few ms. AHI delivers each ahiS_ key event as a call into this script; if CoreLoop threads are
+; uninterruptible (default: first 15 ms / 1000 lines of every thread) the calls sit in a queue, and AHI's device loop
+; blocks behind them, so keys stall and then arrive in one burst. Make every thread interruptible at once.
+Thread, Interrupt, 0, 0
 SetTimer, CoreLoop, %CLTimer%
 if (ConfigWarnings != "")
     MsgBox, 48, Config warnings, %ConfigWarnings%, 30
@@ -956,8 +981,10 @@ WindowCheckLoop:
 return
 
 CoreLoop:
-    if (++WinCheckTick >= WinCheckInterval) {
-        WinCheckTick := 0
+    ; Sleep -1: let pending AHI callbacks (and anything else queued) run before this tick's work, see Thread, Interrupt below
+    Sleep, -1
+    if (A_TickCount - WinCheckLast >= 100) {
+        WinCheckLast := A_TickCount
         Gosub, WindowCheckLoop
     }
     Core_SelectBlock()
@@ -965,6 +992,7 @@ CoreLoop:
         Core_AhiReconcile()
     if (!AppState.IsGameActive) {
         SteerKey.Down := false
+        CLLast := 0
         if (AppState.FocusPass) {
             FocusLost()
             AppState.FocusPass := false
@@ -976,6 +1004,14 @@ CoreLoop:
         SteerKey.Down := StartupMouseSteering
     }
     AppState.FocusPass := true
+
+    if (AhiDebug) {
+        ; DebugMode trace: a CoreLoop that is starved shows up as a gap well above CLTimer
+        nowTick := A_TickCount
+        if (CLLast && nowTick - CLLast > 40)
+            Core_AhiLog("CoreLoop gap " . (nowTick - CLLast) . " ms")
+        CLLast := nowTick
+    }
 
     ReadExternalGamepads()
 
@@ -1061,41 +1097,84 @@ UpdateAllVirtualAxes() {
 
 IsAnyKeyDown(keys) {
     for _, k in keys {
-        if (Core_KeyDown(k))
+        if (KeyPhysDown(k))
             return true
     }
     return false
 }
 
-; Physical key state for the controller mapping. GetKeyState misses keys that an ahiS_ function currently hides from the OS,
-; so those are also looked up in the physical state AHI reported (AhiPhysN, kept by Core_AhiEvent for every subscribed key).
-Core_KeyDown(k) {
-    global AhiOn, AhiPhysN, AhiKeyCache, AhiKeySeen
-    if (GetKeyState(k, "P"))
-        return true
-    if (!AhiOn)
-        return false
-    if (!AhiKeyCache.HasKey(k)) {
-        slots := Core_AhiSlots(k, kerr)
-        keys := []
-        if (IsObject(slots)) {
-            for _, sl in slots {
-                if (sl.Type != "w")
-                    keys.Push(sl.Key)
-            }
+; Physical key state that also sees keys hidden by an ahiS_ subscription. AHI swallows a subscribed key before Windows
+; and AutoHotkey's hook ever see it, so GetKeyState(k, "P") is always false for it. The AHI callback therefore records
+; every down / up it receives (AhiKeyCount, by key id "k<scancode>" / "m<button>"); built-in binds (A=space, dpad, axes)
+; read that first and fall back to GetKeyState for every key AHI is not hiding. For a hidden key that has a single
+; scan code, Core_AhiBypass is consulted as well (every call, so it can follow the AHI state).
+KeyPhysDown(k) {
+    global AhiOn, AhiKeyCount, AhiOwner, AhiBypass
+    if (AhiOn) {
+        ids := Core_AhiKeyIds(k)
+        for _, id in ids {
+            seen := AhiKeyCount.HasKey(id)
+            if (AhiBypass && ids.Length() == 1 && AhiOwner.HasKey(id) && Core_AhiBypass(k, id, seen))
+                return true
+            if (seen)
+                return true
         }
-        AhiKeyCache[k] := keys
     }
-    seen := false
-    for _, sk in AhiKeyCache[k] {
-        if (AhiPhysN[sk] > 0)
-            seen := true
+    return GetKeyState(k, "P")
+}
+
+; Keyboard -> controller bypass for a key AHI is hiding (AhiOwner holds its subscription). AHI reports such a key only
+; through its worker threads, so if those lag, the pad would see nothing. A Wooting keyboard also reports the key to the
+; Wooting SDK, which AHI cannot hide, so the pad can read it from there. The bypass only steps in when the key has been
+; at or above AhiBypassThreshold (1-255 travel) for AhiBypassGrace ms and AHI has not reported it; once AHI reports the
+; press, AHI is in charge of that press until the key has dropped below the threshold again (no hold extension, no
+; re-press while the key travels back up). A key that is not a Wooting key reads 0 here and is left to AHI.
+; State per key id: absent = below threshold, -1 = AHI owns this press, tick count = timing a press AHI has not reported.
+Core_AhiBypass(k, id, ahiSeen) {
+    global WootingEnabled, sw, hid_map, AhiBypassThreshold, AhiBypassGrace, AhiBypassState
+    if (!WootingEnabled || !hid_map.HasKey(k))
+        return false
+    if (sw.RP(k) < AhiBypassThreshold) {
+        AhiBypassState.Delete(id)
+        return false
     }
-    if (seen != (AhiKeySeen[k] ? true : false)) {
-        AhiKeySeen[k] := seen
-        Core_AhiLog("mapper sees " . k . " via AHI = " . (seen ? 1 : 0))
+    if (ahiSeen) {
+        AhiBypassState[id] := -1
+        return false
     }
-    return seen
+    st := AhiBypassState.HasKey(id) ? AhiBypassState[id] : 0
+    if (st == -1)
+        return false
+    if (st == 0) {
+        AhiBypassState[id] := A_TickCount
+        return (AhiBypassGrace <= 0)
+    }
+    return (A_TickCount - st) >= AhiBypassGrace
+}
+
+; Key name used in a bind -> AHI key id(s), same ids as Core_AhiSlots (Shift/Ctrl/Alt/Win cover both sides). Cached.
+Core_AhiKeyIds(name) {
+    static cache := {}
+    static mouseBtn := {lbutton: 0, rbutton: 1, mbutton: 2, xbutton1: 3, xbutton2: 4}
+    static generics := {shift: ["LShift", "RShift"], ctrl: ["LControl", "RControl"], control: ["LControl", "RControl"]
+        , alt: ["LAlt", "RAlt"], win: ["LWin", "RWin"]}
+    if (cache.HasKey(name))
+        return cache[name]
+    low := name
+    StringLower, low, low
+    ids := []
+    if (mouseBtn.HasKey(low)) {
+        ids.Push("m" . mouseBtn[low])
+    } else if (generics.HasKey(low)) {
+        for _, n in generics[low]
+            ids.Push("k" . GetKeySC(n))
+    } else {
+        sc := GetKeySC(name)
+        if (sc)
+            ids.Push("k" . sc)
+    }
+    cache[name] := ids
+    return ids
 }
 
 UpdateDigitalButtons() {
@@ -1107,6 +1186,7 @@ UpdateDigitalButtons() {
         state := IsAnyKeyDown(keys) ? 1 : 0
         if (state != lastButtonState[name]) {
             lastButtonState[name] := state
+            Core_AhiLog("pad " . name . " -> " . state . " controllerActive=" . ControllerActive . " ahiHeld=[" . Core_AhiHeldDump() . "]")
             if (ControllerActive) {
                 pad.Buttons[name].SetState(state)
                 PadDirty := true
@@ -1127,6 +1207,7 @@ UpdateDigitalButtons() {
 
     if (dir != lastDpadState) {
         lastDpadState := dir
+        Core_AhiLog("pad dpad -> " . dir . " controllerActive=" . ControllerActive . " ahiHeld=[" . Core_AhiHeldDump() . "]")
         if (ControllerActive) {
             pad.Dpad.SetState(dir)
             PadDirty := true
@@ -1265,7 +1346,7 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
     DigiOverride[axis] := false
 
     for _, pair in dArray {
-        if (Core_KeyDown(pair[1])) {
+        if (KeyPhysDown(pair[1])) {
             pressure := pair[2]
             if (isStick && axis == MouseSteeringAxisX && LX_D_MovesMouse) {
                 signX := MouseSteeringAxisX_Mult < 0 ? -1 : 1
@@ -1330,8 +1411,10 @@ CommitVirtualPressure(axis, isStick, pressure) {
 PadFlush() {
     global pad, PadDirty
     if (PadDirty) {
-        pad.SendReport()
+        ; clear first: an ahiS_ handler may set PadDirty again while SendReport runs, and that update must not be lost
         PadDirty := false
+        pad.SendReport()
+        Core_AhiLog("pad SendReport")
     }
 }
 
@@ -1930,6 +2013,54 @@ Core_WheelRelease() {
 ;    A key already held when its block activates is simply left alone until released.
 ;  - Subscription changes are skipped while AHI events are in flight (a short quiet gap is required).
 ;  - Each device/key press is tracked (Held): auto-repeat is dropped, orphans (stopped, still physically down) are swallowed.
+; AHI keeps one worker task per (device, key) subscription alive on the .NET thread pool for good: it sits in a blocking
+; Take(), and unsubscribing cannot wake it (Dispose() only cancels a token that Take() never looks at). The pool only
+; creates threads at once up to its MINIMUM; beyond that it injects about one per second. So when the workers (leaked
+; ones from earlier focus changes included) use up the minimum, the workers of the next subscription start one by one:
+; the first key works, the others unlock seconds apart in subscription order, and the presses made meanwhile arrive in
+; one burst. Keeping the minimum above the number of workers ever spawned (plus headroom) makes every worker start the
+; moment it is queued. Returns false only when the pool could not be configured.
+Core_AhiPoolEnsure(extra) {
+    global AhiPoolMin, AhiWorkers
+    static warned := false
+    need := AhiWorkers + extra + 32
+    if (need <= AhiPoolMin)
+        return true
+    target := Min(1000, need + 64)
+    if (target <= AhiPoolMin) {
+        if (!warned) {
+            warned := true
+            Core_AhiLog("pool: " . AhiWorkers . " AHI workers spawned, no headroom left under the 1000 thread cap; restart the mapper to clear them")
+        }
+        return true
+    }
+    ok := Core_AhiPoolSet(target)
+    AhiPoolMin := target                        ; also on failure: do not retry the reflection call on every subscription
+    return ok
+}
+
+; ThreadPool.SetMinThreads(n, n) through the same CLR COM bridge AHI itself is loaded with (see CLR_v1.ahk).
+Core_AhiPoolSet(n) {
+    static tp := ""
+    static _null := ComObject(13, 0)
+    ok := ""
+    try {
+        if (!IsObject(tp)) {
+            clr := Func("CLR_LoadLibrary")           ; looked up by name: the AHI/CLR library is only included when ahiS_ functions exist
+            tp := clr.Call("mscorlib").GetType_2("System.Threading.ThreadPool")
+        }
+        args := ComObjArray(0xC, 2)
+        args[0] := ComObject(3, n)
+        args[1] := ComObject(3, n)
+        ok := tp.InvokeMember_3("SetMinThreads", 0x158, _null, _null, args)
+    } catch e {
+        Core_AhiLog("pool: SetMinThreads failed: " . e.Message)
+        return false
+    }
+    Core_AhiLog("pool: min worker/io threads -> " . n . " ok=" . (ok ? 1 : 0))
+    return ok ? true : false
+}
+
 ; Startup: enumerate every HID keyboard and mouse, resolve each ahiS_ key to scan-code / button slots, build one
 ; binding per function. Core_AhiSync only decides what SHOULD be live; Core_AhiReconcile (CoreLoop) makes it so.
 Core_AhiInit(defs) {
@@ -1981,6 +2112,14 @@ Core_AhiInit(defs) {
             AhiByOrigin[d.Origin] := []
         AhiByOrigin[d.Origin].Push(b)
     }
+    ; size the pool before the first subscription: every slot of every binding on every device, as an upper bound
+    planned := 0
+    for _, b in AhiAll {
+        for _, s in b.Slots
+            planned += (s.Type == "k") ? AhiKeyboards.Length() : AhiMice.Length()
+    }
+    if (!Core_AhiPoolEnsure(planned))
+        Core_Warn("Could not raise the .NET thread-pool minimum; keys hidden by ahiS_ may unlock one by one after tabbing in (see $AHI_DEBUG.log with DebugMode=1).")
     AhiOn := true
     pollFn := Func("Core_WheelPoll")
     SetTimer, % pollFn, 4
@@ -2131,8 +2270,9 @@ Core_AhiSlotHeld(b, s) {
 }
 
 Core_AhiSubSlot(b, s) {
-    global AHI, AhiKeyboards, AhiMice, AhiOwner
+    global AHI, AhiKeyboards, AhiMice, AhiOwner, AhiWorkers
     ids := (s.Type == "k") ? AhiKeyboards : AhiMice
+    Core_AhiPoolEnsure(ids.Length())            ; before the workers exist, so each one starts the moment it is queued
     s.Ids := []
     s.Sub := true
     AhiOwner[s.Key] := b
@@ -2144,6 +2284,7 @@ Core_AhiSubSlot(b, s) {
             else
                 AHI.SubscribeMouseButton(id, s.Code, true, cb)
             s.Ids.Push(id)
+            AhiWorkers += 1                     ; one more AHI worker task that stays on the pool
         } catch e {
             Core_AhiLog("subscribe FAILED ahiS_" . b.Key . " " . s.Name . " dev " . id . ": " . e.Message)
         }
@@ -2177,7 +2318,33 @@ Core_AhiUnsubSlot(b, s) {
     s.Ids := []
     s.Fail := 0
     AhiOwner.Delete(s.Key)
+    Core_AhiClearPhys(s)                        ; no events can arrive any more: GetKeyState is authoritative again
     Core_AhiLog("unsubscribed ahiS_" . b.Key . " " . s.Name)
+}
+
+Core_AhiHeldDump() {
+    global AhiKeyCount, AhiDebug
+    if (!AhiDebug)
+        return ""
+    out := ""
+    for id in AhiKeyCount
+        out .= (out == "" ? "" : ",") . id
+    return out
+}
+
+; Drops the recorded physical state of an unsubscribed key (a lost up event must never leave it stuck down).
+Core_AhiClearPhys(s) {
+    global AhiHeldKeys, AhiKeyCount, AhiBypassState
+    prefix := s.Key . "@"
+    del := []
+    for hk in AhiHeldKeys {
+        if (InStr(hk, prefix) == 1)
+            del.Push(hk)
+    }
+    for _, hk in del
+        AhiHeldKeys.Delete(hk)
+    AhiKeyCount.Delete(s.Key)
+    AhiBypassState.Delete(s.Key)
 }
 
 ; AHI callback (one per device per slot). Reduces raw events to one start / one stop per physical press:
@@ -2187,18 +2354,31 @@ Core_AhiUnsubSlot(b, s) {
 ; script's timers and threads can never start again. So the bookkeeping lives in Core_AhiTrack (no Critical, free to
 ; return anywhere) and this wrapper has exactly one exit.
 Core_AhiEvent(b, devId, s, state) {
-    global AhiLastEvt
+    global AhiLastEvt, AhiHeldKeys, AhiKeyCount
     AhiLastEvt := A_TickCount
     if (s.Type == "w") {
         Core_AhiWheel(b, s, state)
         return
     }
-    Core_AhiLog("evt ahiS_" . b.Key . " " . s.Key . "@" . devId . " state=" . (state ? 1 : 0))
+    hk := s.Key . "@" . devId
     crit := A_IsCritical
     Critical, On
-    Core_AhiPhysTrack(s, devId, state)
+    ; physical state for KeyPhysDown, recorded for every event whether or not the block currently wants the key
+    if (state) {
+        if (!AhiHeldKeys.HasKey(hk)) {
+            AhiHeldKeys[hk] := 1
+            AhiKeyCount[s.Key] := AhiKeyCount.HasKey(s.Key) ? AhiKeyCount[s.Key] + 1 : 1
+        }
+    } else if (AhiHeldKeys.HasKey(hk)) {
+        AhiHeldKeys.Delete(hk)
+        if (AhiKeyCount[s.Key] > 1)
+            AhiKeyCount[s.Key] -= 1
+        else
+            AhiKeyCount.Delete(s.Key)
+    }
     act := Core_AhiTrack(b, devId, s, state)
     Critical, %crit%
+    Core_AhiLog("evt ahiS_" . b.Key . " " . s.Key . "@" . devId . " state=" . (state ? 1 : 0))   ; file I/O only after the pad-visible state is recorded
     if (act) {
         Core_AhiLog((act == 1 ? "start" : "stop") . " ahiS_" . b.Key)
         Core_AhiCall(b, act == 1 ? 1 : 0)
@@ -2218,23 +2398,6 @@ Core_AhiWheel(b, s, state) {
         return
     }
     Core_AhiCall(b, up)
-}
-
-; Physical state of every subscribed key, independent of ownership (wanted / orphan) so the controller mapping keeps working.
-; Auto-repeat is ignored; a key that went down before it was subscribed has no entry, so its up is ignored too.
-Core_AhiPhysTrack(s, devId, state) {
-    global AhiPhys, AhiPhysN
-    hk := s.Key . "@" . devId
-    n := AhiPhysN.HasKey(s.Key) ? AhiPhysN[s.Key] : 0   ; "" + 1 is "" in AHK v1, so never add to a missing value
-    if (state) {
-        if (!AhiPhys.HasKey(hk)) {
-            AhiPhys[hk] := 1
-            AhiPhysN[s.Key] := n + 1
-        }
-    } else if (AhiPhys.HasKey(hk)) {
-        AhiPhys.Delete(hk)
-        AhiPhysN[s.Key] := (n > 0) ? n - 1 : 0
-    }
 }
 
 ; Returns 1 = call start, 2 = call stop, 0 = nothing to do.
@@ -2267,11 +2430,15 @@ Core_AhiTrack(b, devId, s, state) {
 }
 
 Core_AhiCall(b, state) {
+    global PadDirty
     fn := b.Fn
     if (fn.MaxParams >= 1 || fn.IsVariadic)
         fn.Call(state)
     else
         fn.Call()
+    ; pad is created with AutoSend := false, so pad.*.SetState() inside an ahiS_ function only changes the in-memory
+    ; report. Flag it so CoreLoop's PadFlush sends it (within one CLTimer tick).
+    PadDirty := true
 }
 
 Core_AhiLog(msg) {
