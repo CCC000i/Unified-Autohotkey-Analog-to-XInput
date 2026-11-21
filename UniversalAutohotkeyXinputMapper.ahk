@@ -1,7 +1,6 @@
 ; Requires ViGEmBus to be installed, + bundled scripts and DLLs in \Lib
-; If Interception is not installed, set EnableAHI=0 in $MapperConfigs\.Settings.ini
-; .Settings.ini [GlobalSettings]: configAliases, exeMatches, EnableAHI, WootingEnabled, ExternalXInputEnabled,
-;   DebugMode, AHITrace (1 = log every intercepted key event to $MapperConfigs\.ahi_trace.log),
+; .Settings.ini [GlobalSettings]: configAliases, exeMatches, WootingEnabled, ExternalXInputEnabled,
+;   DebugMode, AutoHotInterceptionEnabled (default 1; only matters when an ahiS_ function exists),
 ;   RelaunchHotkey (default #t), ExitHotkey (default #u; blank disables either hotkey)
 ;
 ; === Conditional INI blocks ===
@@ -15,7 +14,7 @@
 ;                         are the [[[ ]]] block's own base profile, which flag blocks inherit from.
 ;   [[[Prepend]]]         optional; must be the first block in the file. May only contain [CustomAutoexecute]
 ;                         and/or [CustomSubroutine]. These are never overridden: the autoexec runs once (before the
-;                         first block's own), and the subroutine's hotkeys/ahiS_ handlers are active in every block.
+;                         first block's own), and the subroutine's hotkeys are active in every block.
 ;                         Put persistent [[flag]] logic here. On a duplicate hotkey/handler, Prepend wins.
 ; Inheritance: [Settings]/[AnalogBinds]/[DigitalBinds]/[DigitalButtons] override per key (a key that is
 ; present but blank overrides with blank). [CustomAutoexecute]/[CustomSubroutine] override per section
@@ -23,25 +22,70 @@
 ; Block mode: [CustomAutoexecute] runs once, in its own thread, the first time a block using it becomes
 ; active; it is wrapped in an assume-global function, so use the Hotkey command instead of hotkey labels.
 ; [CustomSubroutine] hotkeys are scoped to their block via #If (your own #IfWinActive/#If lines inside it are
-; rewritten to keep the block scope); ahiS_* handlers are namespaced per block
-; automatically, but your own helper function names must be unique across blocks.
+; rewritten to keep the block scope); your own helper function names must be unique across blocks.
 ; ahk_group ActiveGameGroup = all exes of all [[[exe]]] blocks (v1 groups can't shrink). The active block's
 ; own exes are in the group named by the variable ActiveGameGroupName (blank under Default):
 ;   WinActive("ahk_group " ActiveGameGroupName)
+
+; === AutoHotInterception: ahiS_<key>[(start)] pseudo-functions ===
+; In a [CustomSubroutine] (also [[[Prepend]]]) a function named ahiS_<key> subscribes that key through AutoHotInterception
+; while its block is active, i.e. while the [[[exe]]] it sits in is focused ([[[Prepend]]]'s are live in every block).
+; The physical key is hidden from the OS on every HID keyboard / mouse found at script start, so games that ignore normal
+; AutoHotkey input never see it. The function runs once per press and once per release: auto-repeat
+; is filtered. The parameter is optional and its name is free: with one, e.g. (start), it is 1 on press and 0 on release;
+; without one - ahiS_up(), ahiS_up {  or  ahiS_up{ - the body simply runs on both press and release. No return needed. Hand-over is release-safe: a key held when its block deactivates gets start = 0 at once but
+; stays hidden until you let go; a key already held when its block activates is left alone until released (a hidden down
+; or up without its partner would leave the key dead system-wide). With DebugMode=1 events are logged to $AHI_DEBUG.log.
+;   ahiS_up(start) {          ; up arrow is swallowed, the game gets down instead
+;       if start
+;           send, {down down}
+;       else
+;           send, {down up}
+;   }
+; <key> = any AHK key name that can be held: letters, digits, F1-F24, Numpad*, arrows, Home/End/..., modifiers (Shift, Ctrl,
+; Alt, Win cover both sides: start on the first down, stop on the last up), media/browser/launch keys, LButton RButton
+; MButton XButton1 XButton2, scXXX / vkXX, plus these spellings for punctuation: Comma Period Dot Semicolon Slash
+; Backslash Minus Equals Apostrophe Backtick LeftBracket RightBracket. Joystick is not supported; for the wheel see below.
+; Keys are resolved by scan code, so letters follow the active keyboard layout. A hidden key is invisible to hotkeys and
+; GetKeyState(,"P"), but NOT to the controller mapping: DigitalButtons / DPad / axis key binds still see the physical key
+; (ahiS_w {} does not stop DPadUp=W). Needs AutoHotInterception_v1 + the Interception driver; the library is only loaded when an ahiS_
+; function exists. The same physical key in Prepend and a block: Prepend wins (like hotkeys).
+; Mouse wheel: ahiS_wheel(up) and ahiS_hwheel(up) run once per wheel notch (there is no release). up = 1 for wheel up / tilt
+; right, 0 for wheel down / tilt left; omit the parameter if you don't care. The notch is swallowed while the block is active.
+;   ahiS_wheel(up) {
+;       if up
+;           send, {PgUp}
+;       else
+;           send, {PgDn}
+;   }
+; Wheel -> key tap shorthand (no body, max 1 queued):  ahiS_wheel::up,down[,hold1[,hold2[,wait]]]
+;                                                      ahiS_hwheel::left,right[,hold1[,hold2[,wait]]]
+; Every notch taps its key. The two keys are required (first = wheel up / tilt left, second = wheel down / tilt right);
+; the optional numbers are ms. No number: holds 25/25, end wait 25. One number: end wait. Two: hold of key 1, hold of
+; key 2 (wait stays 25). Three: hold 1, hold 2, end wait. A running tap is never cut short: it completes its hold and
+; end wait first. A notch arriving while one is running is kept in a single queue slot (more notches just refresh it, the
+; latest direction wins) and taps as soon as the running one is done, so a spin plays back as an even stream of taps
+; (hold + wait apart) and never builds a backlog. The keys are sent from a ~4 ms poll timer, not
+; from the AHI callback (a blocking callback would stall all subscribed keys), so timings are accurate to a few ms.
+; Key -> key shorthand for holdable keys:   ahiS_o::down
+; is the same as   ahiS_o(start) { if start {send, {down down}} else {send, {down up}} }   (the target is held while the
+; physical key is held). Any key name Send understands works as the target.
 
 ; Toggle: starting this script externally while the mapper runs closes it (and exits) instead of replacing it.
 ; Start with /restart to close a running mapper and start a fresh one instead. The mapper's own relaunch passes /relaunch to skip this.
 
 ; NOTE: plain assignments in [CustomSubroutine] never execute (they sit after the auto-execute return).
 ; Put initialisers in [CustomAutoexecute].
+;
+; Helpers callable from [CustomSubroutine] hotkeys, e.g.  F9::ActivateController()
+;   ActivateController() / DeactivateController()         (virtual pad on/off)
+;   ActivateMouseSteering() / DeactivateMouseSteering()
 
 #Requires AutoHotkey v1.1
 #NoEnv
 #SingleInstance Force
 SetBatchLines, -1
 SetWorkingDir, %A_ScriptDir%
-
-Global DebugMode := false
 
 ; --- Directory Setup & Global Settings Load ---
 settingsDir := A_ScriptDir . "\$MapperConfigs"
@@ -77,14 +121,14 @@ if FileExist(sessionFile) {
 
 if (matchedConfig == "") {
     defaultProfile := ""
-    
+
     ; 1. Primary check: Use explicit exeMatches from .Settings file
     For profileName, exeList in exeMatches {
         For _, exeName in exeList {
             Process, Exist, %exeName%
-            if (ErrorLevel) { 
+            if (ErrorLevel) {
                 defaultProfile := profileName
-                break 2 
+                break 2
             }
         }
     }
@@ -109,10 +153,10 @@ if (matchedConfig == "") {
         {
             if (SubStr(A_LoopFileName, 1, 1) == ".")
                 continue
-                
+
             SplitPath, A_LoopFileName,,,, fileNameNoExt
             Process, Exist, %fileNameNoExt%.exe
-            if (ErrorLevel) { 
+            if (ErrorLevel) {
                 defaultProfile := fileNameNoExt
                 break
             }
@@ -124,14 +168,14 @@ if (matchedConfig == "") {
         InputBox, userInput, Load Config, Enter config alias or file name (without .ini).`nHold Ctrl+Shift on script start or press Win+T`nto see this window again.,, 320, 160,,,,, %defaultProfile%
         if (ErrorLevel)
             ExitApp
-        
+
         userInput := Trim(userInput)
-        
+
         if configAliases.HasKey(userInput)
             matchedConfig := configAliases[userInput]
         else if FileExist(settingsDir . "\" . userInput . ".ini")
             matchedConfig := userInput
-        
+
         if (matchedConfig != "") {
             FileDelete, %sessionFile%
             FileAppend, %matchedConfig%, %sessionFile%
@@ -143,12 +187,12 @@ if (matchedConfig == "") {
 ; === Dynamic Config Load ===
 configFile := settingsDir . "\" . matchedConfig . ".ini"
 FileRead, FileContent, %configFile%
-FileContent := ToCRLF(FileContent)
 if (ErrorLevel) {
     MsgBox, 16, Error, Config INI could not be read.
     FileDelete, %sessionFile%
     ExitApp
 }
+FileContent := ToCRLF(FileContent)
 
 ; Parse -> resolve inheritance -> generate per-block data and code
 blockMode := false
@@ -157,22 +201,23 @@ cfgGroups := ParseConfig(FileContent, blockMode, cfgPrepend)
 Compiled := CompileConfig(cfgGroups, !blockMode, cfgPrepend)
 
 ; === Dynamic Script Compilation ===
-IniRead, EnableAHI, %settingsFile%, GlobalSettings, EnableAHI, 1
 IniRead, WootingEnabled, %settingsFile%, GlobalSettings, WootingEnabled, 1
 IniRead, ExternalXInputEnabled, %settingsFile%, GlobalSettings, ExternalXInputEnabled, 1
 IniRead, RelaunchHotkey, %settingsFile%, GlobalSettings, RelaunchHotkey, #t
 IniRead, ExitHotkey, %settingsFile%, GlobalSettings, ExitHotkey, #u
-IniRead, AHITrace, %settingsFile%, GlobalSettings, AHITrace, 0
+IniRead, AhiEnabled, %settingsFile%, GlobalSettings, AutoHotInterceptionEnabled, 1
+AhiUsed := (AhiEnabled && Compiled.AhiCount > 0) ? 1 : 0
 
-GlobalInject := "Global EnableAHI := " . (EnableAHI ? 1 : 0) . "`nGlobal WootingEnabled := " . (WootingEnabled ? 1 : 0)
-GlobalInject .= "`nGlobal ExternalXInputEnabled := " . (ExternalXInputEnabled ? 1 : 0) . "`nGlobal AHITrace := " . (AHITrace ? 1 : 0)
+GlobalInject := "Global WootingEnabled := " . (WootingEnabled ? 1 : 0)
+GlobalInject .= "`nGlobal ExternalXInputEnabled := " . (ExternalXInputEnabled ? 1 : 0)
 GlobalInject .= "`nGlobal RelaunchHotkey := " . AhkQ(RelaunchHotkey) . "`nGlobal ExitHotkey := " . AhkQ(ExitHotkey) . "`n"
+GlobalInject .= "Global AhiEnabled := " . AhiUsed . ", AhiDebug := " . (DebugMode ? 1 : 0) . "`n"
 
 IncludeDirectives := "#Include <AHK-ViGEm-Bus_v1>`n"
 if (WootingEnabled)
     IncludeDirectives .= "#Include <SimpleWooting_v1>`n"
-if (EnableAHI)
-    IncludeDirectives := "#Include <AutoHotInterception_v1>`n" . IncludeDirectives
+if (AhiUsed)
+    IncludeDirectives .= "#InstallKeybdHook`n#InstallMouseHook`n#Include <AutoHotInterception_v1>`n"
 
 FileRead, selfCode, %A_ScriptFullPath%
 if (ErrorLevel || selfCode == "") {
@@ -181,6 +226,10 @@ if (ErrorLevel || selfCode == "") {
 }
 RegExMatch(selfCode, "s)\/\*\s*\[CORE_LOGIC_START\]\R(.*?)\R\[CORE_LOGIC_END\]\s*\*\/", coreMatch)
 CoreLogic := coreMatch1
+if (CoreLogic == "") {
+    MsgBox, 16, Error, Core logic block not found in the launcher script.
+    ExitApp
+}
 
 FullScriptString := IncludeDirectives . "`n" . GlobalInject . "`n" . Compiled.LegacyAuto . "`n" . CoreLogic
 FullScriptString .= "`n`n; === BLOCK DATA ===`n" . Compiled.DataFunc
@@ -447,6 +496,90 @@ ResolveBlock(grpObj, gi, flagObj, fi) {
     return r
 }
 
+; ahiS_<key>::<target>  ->  a generated ahiS_<key>(start) that holds <target> while the physical key is held.
+AhiKeyShorthand(indent, key, targetText, origin, defs) {
+    target := Trim(RegExReplace(targetText, "(^|\s);.*$"))
+    if (target == "")
+        ConfigFail("ahiS_" . key . ":: needs a target key, e.g. ahiS_" . key . "::down")
+    name := "Core_Ahi" . origin . "_" . key
+    defs.Push({Origin: origin, Key: key, Func: name})
+    return indent . name . "(start) {`n" . indent . "    if start {`n" . indent . "        send, {" . target . " down}`n" . indent . "    } else {`n" . indent . "        send, {" . target . " up}`n" . indent . "    }`n" . indent . "}"
+}
+
+; ahiS_wheel::up,down[,hold1[,hold2[,wait]]]  /  ahiS_hwheel::left,right[,...]  ->  a generated ahiS_ function that calls
+; Core_WheelNotch. Key 1 / hold 1 belong to wheel up (hwheel: left), key 2 / hold 2 to wheel down (hwheel: right).
+AhiWheelShorthand(indent, kind, argText, origin, defs) {
+    StringLower, kind, kind
+    argText := Trim(RegExReplace(argText, "(^|\s);.*$"))
+    parts := StrSplit(argText, ",", " `t")
+    if (parts.Length() < 2 || parts[1] == "" || parts[2] == "")
+        ConfigFail("ahiS_" . kind . ":: needs two keys, e.g. ahiS_" . kind . "::" . (kind == "wheel" ? "up,down" : "left,right") . ",25,25")
+    nums := []
+    Loop, % parts.Length() - 2
+    {
+        v := parts[A_Index + 2]
+        if v is not integer
+            ConfigFail("ahiS_" . kind . ":: '" . v . "' is not a whole number of milliseconds.")
+        if (v < 0)
+            ConfigFail("ahiS_" . kind . ":: times can't be negative.")
+        nums.Push(v + 0)
+    }
+    if (nums.Length() > 3)
+        ConfigFail("ahiS_" . kind . ":: takes at most 3 numbers (hold 1, hold 2, end wait).")
+    h1 := 25, h2 := 25, wait := 25
+    n := nums.Length()
+    if (n == 1)
+        wait := nums[1]
+    else if (n == 2)
+        h1 := nums[1], h2 := nums[2]
+    else if (n == 3)
+        h1 := nums[1], h2 := nums[2], wait := nums[3]
+    name := "Core_Ahi" . origin . "_" . kind
+    defs.Push({Origin: origin, Key: kind, Func: name})
+    first := (kind == "hwheel") ? "!up" : "up"       ; hwheel: up = 1 is right, which is key 2
+    return indent . name . "(up) {`n" . indent . "    static st := {Notch: 0, Seen: 0, Phase: 0}`n" . indent . "    Core_WheelNotch(st, " . first . ", " . AhkQ(parts[1]) . ", " . AhkQ(parts[2]) . ", " . h1 . ", " . h2 . ", " . wait . ")`n" . indent . "}"
+}
+
+; Finds ahiS_<key>[(<param>)] pseudo-function definitions in one [CustomSubroutine] text, renames each to a unique real
+; function (Core_Ahi<origin>_<key>) and records it in defs for Core_AhiInit. The parameter list is optional (ahiS_up {  and
+; ahiS_up(){  both work; "()" is added when missing). A line only counts as a definition when its { is on that line or on
+; the next non-blank line, so a plain call like ahiS_up(1) is left alone.
+ExtractAhiFunctions(txt, origin, ByRef defs) {
+    lines := StrSplit(txt, "`n")
+    for i, line in lines {
+        if RegExMatch(line, "Oi)^([ \t]*)ahiS_(h?wheel)[ \t]*::(.*)$", W) {
+            lines[i] := AhiWheelShorthand(W.Value(1), W.Value(2), W.Value(3), origin, defs)
+            continue
+        }
+        if RegExMatch(line, "Oi)^([ \t]*)ahiS_(\w+)[ \t]*::(.*)$", K) {
+            lines[i] := AhiKeyShorthand(K.Value(1), K.Value(2), K.Value(3), origin, defs)
+            continue
+        }
+        if !RegExMatch(line, "Oi)^([ \t]*)ahiS_(\w+)([ \t]*\([^()]*\))?(.*)$", M)
+            continue
+        rest := Trim(M.Value(4))
+        if (SubStr(rest, 1, 1) == "{") {
+            isDef := true
+        } else if (rest == "" || SubStr(rest, 1, 1) == ";") {
+            j := i + 1
+            while (j <= lines.Length() && Trim(lines[j]) == "")
+                j++
+            isDef := (j <= lines.Length() && SubStr(LTrim(lines[j]), 1, 1) == "{")
+        } else {
+            isDef := false
+        }
+        if (!isDef)
+            continue
+        newName := "Core_Ahi" . origin . "_" . M.Value(2)
+        lines[i] := M.Value(1) . newName . (M.Value(3) != "" ? LTrim(M.Value(3)) : "()") . M.Value(4)
+        defs.Push({Origin: origin, Key: M.Value(2), Func: newName})
+    }
+    out := ""
+    for i, line in lines
+        out .= (i > 1 ? "`n" : "") . line
+    return out
+}
+
 ; Produces: DataFunc (Core_BlockData() source), AutoFuncs (Core_AutoN functions),
 ;           SubSegments (per-origin [CustomSubroutine] code), LegacyAuto (inline autoexec, legacy only)
 CompileConfig(groups, legacy, prepend := "") {
@@ -524,36 +657,7 @@ CompileConfig(groups, legacy, prepend := "") {
                 }
             }
 
-            ; $-prefixed keys in this block's binds: subscribed + swallowed even without a handler function
-            swallow := {}
-            for k, v in r.DigitalBinds {
-                p := 1
-                while (p := RegExMatch(v, "O)\$([A-Za-z0-9_]+)\s*:", m, p)) {
-                    swallow[m.Value(1)] := 1
-                    p := m.Pos(0) + m.Len(0)
-                }
-            }
-            for k, v in r.DigitalButtons {
-                p := 1
-                while (p := RegExMatch(v, "O)(?:^|,)\s*\$([A-Za-z0-9_]+)", m, p)) {
-                    swallow[m.Value(1)] := 1
-                    p := m.Pos(0) + m.Len(0)
-                }
-            }
-
-            for k, v in r.AnalogBinds {
-                p := 1
-                while (p := RegExMatch(v, "O)(?:^|,)\s*\$([A-Za-z0-9_]+)\s*:", m, p)) {
-                    swallow[m.Value(1)] := 1
-                    p := m.Pos(0) + m.Len(0)
-                }
-            }
-
-            st := r.Settings["StartupMouseTranslation"]
-            usesTrans := ((st != "" && st != "0") || RegExMatch(r.CustomSubroutineText . "`n" . pSub, "i)::\s*MouseTranslation\b|ActivateMouseTranslation")) ? 1 : 0
-
             blockLines .= "blk := {}`n"
-            blockLines .= "blk.UsesTranslation := " . usesTrans . "`n"
             blockLines .= "blk.RunAlways := " . (g.IsDefault ? 1 : 0) . "`n"
             blockLines .= "blk.SubOrigin := " . subOrigin . "`n"
             blockLines .= "blk.AutoOrigin := " . autoOrigin . "`n"
@@ -562,9 +666,6 @@ CompileConfig(groups, legacy, prepend := "") {
                 for k, v in r[sn]
                     blockLines .= "blk." . sn . "[" . AhkQ(k) . "] := " . AhkQ(v) . "`n"
             }
-            blockLines .= "blk.Swallow := {}`n"
-            for k in swallow
-                blockLines .= "blk.Swallow[" . AhkQ(k) . "] := 1`n"
             blockLines .= "blks.Push(blk)`n"
         }
 
@@ -578,7 +679,14 @@ CompileConfig(groups, legacy, prepend := "") {
         groupLines .= "grps.Push(grp)`n"
     }
 
-    dataFunc := "Core_BlockData() {`n    blks := []`n    grps := []`n" . blockLines . groupLines . "    return {Blocks: blks, Groups: grps, PrependSub: " . prependSubId . ", PrependAuto: " . prependAutoId . "}`n}`n"
+    ahiDefs := []
+    for id, txt in subText
+        subText[id] := ExtractAhiFunctions(txt, id, ahiDefs)
+    ahiLines := "    ahd := []`n"
+    for _, d in ahiDefs
+        ahiLines .= "    ahd.Push({Origin: " . d.Origin . ", Key: " . AhkQ(d.Key) . ", Func: " . AhkQ(d.Func) . "})`n"
+
+    dataFunc := "Core_BlockData() {`n    blks := []`n    grps := []`n" . ahiLines . blockLines . groupLines . "    return {Blocks: blks, Groups: grps, PrependSub: " . prependSubId . ", PrependAuto: " . prependAutoId . ", AhiDefs: ahd}`n}`n"
 
     autoFuncs := ""
     for id, txt in autoText
@@ -586,8 +694,6 @@ CompileConfig(groups, legacy, prepend := "") {
 
     subSegs := ""
     for id, txt in subText {
-        txt := ExpandAhiShorthand(txt)
-        txt := RegExReplace(txt, "i)\bahiS_(\w+)", "O" . id . "_ahiS_$1")
         if (legacy) {
             subSegs .= txt . "`nreturn`n`n"
         } else {
@@ -597,7 +703,7 @@ CompileConfig(groups, legacy, prepend := "") {
         }
     }
 
-    return { DataFunc: dataFunc, AutoFuncs: autoFuncs, SubSegments: subSegs, LegacyAuto: legacyAuto }
+    return { DataFunc: dataFunc, AutoFuncs: autoFuncs, SubSegments: subSegs, LegacyAuto: legacyAuto, AhiCount: ahiDefs.Length() }
 }
 
 ; Block mode only: user context directives inside a block's text must NOT replace the block's own
@@ -634,20 +740,6 @@ ToCRLF(s) {
     return StrReplace(StrReplace(s, "`r`n", "`n"), "`n", "`r`n")
 }
 
-ExpandAhiShorthand(t) {
-    t := ToCRLF(t)
-    t := RegExReplace(t, "mi)^[ \t]*ahiS_(H?Wheel)[ \t]*::[ \t]*(\w+),(\w+)(?:,(\d+))?[ \t\r]*(?:;.*)?$", "ahiS_$1(direction) {`n    if (direction == 1) {`n        <WHEEL:$2:$4>`n    } else if (direction == -1) {`n        <WHEEL:$3:$4>`n    }`n}")
-    t := RegExReplace(t, "i)[ \t]*<WHEEL:return:[^>]*>", "")
-    t := RegExReplace(t, "i)<WHEEL:(\w+):>", "Send, {$1 down}`n        Sleep, 25`n        Send, {$1 up}")
-    t := RegExReplace(t, "i)<WHEEL:(\w+):(\d+)>", "Send, {$1 down}`n        Sleep, $2`n        Send, {$1 up}")
-    t := RegExReplace(t, "mi)^[ \t]*ahiS_(\w+)[ \t]*::[ \t]*MouseSteering[ \t\r]*(?:;.*)?$", "ahiS_$1(state) {`n    if state {`n        ActivateMouseSteering()`n    }`n    else {`n        DeactivateMouseSteering()`n    }`n}")
-    t := RegExReplace(t, "mi)^[ \t]*ahiS_(\w+)[ \t]*::[ \t]*MouseTranslation[ \t\r]*(?:;.*)?$", "ahiS_$1(state) {`n    if state {`n        ActivateMouseTranslation()`n    }`n    else {`n        DeactivateMouseTranslation()`n    }`n}")
-    t := RegExReplace(t, "mi)^[ \t]*ahiS_(\w+)[ \t]*::[ \t]*ProcessController[ \t\r]*(?:;.*)?$", "ahiS_$1(state) {`n    if state {`n        ActivateController()`n    }`n    else {`n        DeactivateController()`n    }`n}")
-    t := RegExReplace(t, "mi)^[ \t]*ahiS_(\w+)[ \t]*::[ \t]*(?:return)?[ \t\r]*(?:;.*)?$", "ahiS_$1(state) {`n}")
-    t := RegExReplace(t, "mi)^[ \t]*ahiS_(\w+)[ \t]*::[ \t]*([^ \t\r;]+)[ \t\r]*(?:;.*)?$", "ahiS_$1(state) {`n    if state {`n        Send, {$2 down}`n    }`n    else {`n        Send, {$2 up}`n    }`n}")
-    return StrReplace(t, "`r`n", "`n")
-}
-
 ; ==========================================
 ; CORE LOGIC SCRIPT RESOURCE STARTS HERE
 ; ==========================================
@@ -663,6 +755,7 @@ ExpandAhiShorthand(t) {
 #HotkeyInterval 0
 #MaxThreads 255
 SetBatchLines, -1
+SetMouseDelay, -1
 CoordMode, Mouse, Screen
 
 Menu, Tray, NoStandard
@@ -674,7 +767,7 @@ Menu, Tray, Add, Exit Script, Exit_Script
 
 ; Safety Hooks
 OnExit("CleanUp")
-DllCall("winmm\timeBeginPeriod", "UInt", 1) 
+DllCall("winmm\timeBeginPeriod", "UInt", 1)
 
 matchedConfig := A_Args[1]
 launcherName := A_Args[2]
@@ -689,18 +782,14 @@ corePid := DllCall("GetCurrentProcessId")
 FileDelete, %pidFile%
 FileAppend, %corePid%, %pidFile%
 
-; EnableAHI / WootingEnabled / ExternalXInputEnabled / RelaunchHotkey / ExitHotkey are injected by the launcher
+; WootingEnabled / ExternalXInputEnabled / RelaunchHotkey / ExitHotkey are injected by the launcher
 
 ; === Global State & Constants Object ===
 Global CLTimer := 5
 Global hXInput := 0
 Global ActiveGameHWND := 0 ; cached window handle
 ; --- Per-profile settings (assigned by Core_ApplyProfile whenever the active block changes) ---
-Global StartupMouseSteering := 0, StartupMouseTranslation := 0
-Global AHIMouseTranslation := 0
-Global MouseTranslationAxisX := "", MouseTranslationAxisX_Mult := 1.0
-Global MouseTranslationAxisY := "", MouseTranslationAxisY_Mult := 1.0
-Global MouseTranslationSensitivity := 15.0, MouseTranslationDecay := 0.75
+Global StartupMouseSteering := 0
 Global MouseSteeringAxisX := "", MouseSteeringAxisX_Mult := 1.0
 Global MouseSteeringAxisY := "", MouseSteeringAxisY_Mult := 1.0
 Global MouseSteerWidth := 1.0, MouseSteerDeadzone := 0
@@ -715,9 +804,13 @@ Global Blocks := [], Groups := [], AutoRan := {}
 Global DefaultGroupIdx := 0, ActiveGroupIdx := 0, ActiveBlockIdx := 0, ActiveSubOrigin := 0
 Global PrependSubOrigin := 0, PrependAutoOrigin := 0
 Global ActiveGameGroupName := ""
-Global AHIMouse := { DeltaX: 0, DeltaY: 0, StickX: 0, StickY: 0, RawDeltaX: 0, RawDeltaY: 0, LastTick: 0 }
-Global AHI_DigiState := {}
 Global DigiOverride := {}
+
+; --- AutoHotInterception (AhiEnabled is injected by the launcher: 1 only when ahiS_ functions exist) ---
+Global AHI := "", AhiOn := false, AhiKeyboards := [], AhiMice := [], AhiByOrigin := {}, AhiAll := []
+Global AhiOwner := {}, AhiDirty := false, AhiLastEvt := 0, WheelStates := []
+Global AhiKeyCache := {}, AhiKeySeen := {}
+Global AhiPhys := {}, AhiPhysN := {}   ; physical key state seen by AHI (hk -> 1, slotKey -> count), read by Core_KeyDown
 
 Global SPI_SETCURSORS := 0x57, SWP_NOSIZE_NOZORDER_NOACTIVATE := 0x15, IMAGE_CURSOR := 2
 Global CONST := { MULT_POS: 128.49803, MULT_NEG: 128.50196, READ_MULT: 0.00778198 }
@@ -761,17 +854,17 @@ VarSetCapacity(CurrentClip, 16, 0)
 ; === Pre-ViGEm External Controller Detection ===
 Global ExternalGamepads := []
 Global ExtPadState := {LX: 0, LY: 0, RX: 0, RY: 0, LT: 0, RT: 0}
-Global pXInputGetState := 0 
+Global pXInputGetState := 0
 
 if (ExternalXInputEnabled) {
     hXInput := DllCall("LoadLibrary", "Str", "xinput1_4.dll", "Ptr")
     if (!hXInput)
         hXInput := DllCall("LoadLibrary", "Str", "xinput1_3.dll", "Ptr")
-    
+
     if (hXInput) {
         pXInputGetState := DllCall("GetProcAddress", "Ptr", hXInput, "AStr", "XInputGetState", "Ptr")
         VarSetCapacity(XINPUT_STATE, 16, 0)
-        Loop, 4 
+        Loop, 4
         {
             idx := A_Index - 1
             if (DllCall(pXInputGetState, "UInt", idx, "Ptr", &XINPUT_STATE) == 0)
@@ -815,58 +908,17 @@ Core_UpdateActiveGroup()
 initIdx := Core_ResolveBlockIdx()
 Core_LoadProfile(initIdx ? initIdx : 1)
 SteerKey.Down := StartupMouseSteering
-AHIMouseTranslation := StartupMouseTranslation
 ; ActiveBlockIdx stays 0 here: the first CoreLoop tick selects the block and runs its autoexec
 
 ; === Libraries & Device Initialization ===
-; AHI subscriptions are dynamic: only the keys/buttons the ACTIVE block handles are intercepted (see Core_SyncAHI).
-; While no block is active nothing is intercepted at all.
-Global AHISubs := {}, AHIKbd := [], AHIMice := [], OSDown := {}
-if (EnableAHI) {
-    Global ahi := new AutoHotInterception()
-    MouseButtons := { "LButton": 0, "RButton": 1, "MButton": 2, "XButton1": 3, "XButton2": 4 }
-    KeysToScan := ["Space", "LAlt", "RAlt", "LCtrl", "RCtrl", "LShift", "RShift", "Enter", "Tab", "Esc"
-                , "Backspace", "Delete", "Up", "Down", "Left", "Right", "Home", "End", "PgUp", "PgDn"
-                , "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"
-                , "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"
-                , "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"
-                , "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"
-                , "F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24"
-                , "Insert", "CapsLock", "NumLock", "ScrollLock", "PrintScreen", "Pause", "AppsKey", "LWin", "RWin"
-                , "Numpad0", "Numpad1", "Numpad2", "Numpad3", "Numpad4", "Numpad5", "Numpad6", "Numpad7", "Numpad8", "Numpad9"
-                , "NumpadDot", "NumpadAdd", "NumpadSub", "NumpadMult", "NumpadDiv", "NumpadEnter"]
-
-    scanSet := {}
-    for _, kn in KeysToScan
-        scanSet[kn] := 1
-    for bi, b in Blocks {
-        for kn in b.Swallow {
-            if (!scanSet.HasKey(kn) && !MouseButtons.HasKey(kn) && kn != "Wheel" && kn != "HWheel")
-                Core_Warn("Block " . bi . ": $" . kn . " is not a suppressible key name (check spelling, e.g. Esc not Escape).")
-        }
-    }
-
-    for _, device in ahi.GetDeviceList() {
-        if (device.isMouse)
-            AHIMice.Push(device.Id)
-        else
-            AHIKbd.Push(device.Id)
-    }
-}
-
-if (!EnableAHI) {
-    for bi, b in Blocks {
-        for kn in b.Swallow
-            Core_Warn("EnableAHI=0: $" . kn . " in block " . bi . " cannot suppress input.")
-    }
-}
-
 Global pad := new ViGEmXb360()
 pad.AutoSend := false
 if (WootingEnabled) {
     Global sw := SimpleWooting_v1
     sw.Init()
 }
+if (AhiEnabled)
+    Core_AhiInit(BlockData.AhiDefs)
 
 ; === GUI Initialization ===
 Gui, +LastFound +AlwaysOnTop -Caption +ToolWindow +E0x20
@@ -878,7 +930,7 @@ Global CrosshairHwnd := WinExist()
 Gui, 2:+LastFound +AlwaysOnTop -Caption +ToolWindow +E0x20
 Gui, 2:Color, Red
 Gui, 2:Add, Progress, x1 y0 w1 h10000 BackgroundWhite
-WinSet, Transparent, 127          
+WinSet, Transparent, 127
 Global LineHwnd := WinExist()
 
 Gosub, WindowCheckLoop
@@ -909,6 +961,8 @@ CoreLoop:
         Gosub, WindowCheckLoop
     }
     Core_SelectBlock()
+    if (AhiDirty)
+        Core_AhiReconcile()
     if (!AppState.IsGameActive) {
         SteerKey.Down := false
         if (AppState.FocusPass) {
@@ -920,24 +974,17 @@ CoreLoop:
 
     if (!AppState.FocusPass) {
         SteerKey.Down := StartupMouseSteering
-        AHIMouseTranslation := StartupMouseTranslation
     }
     AppState.FocusPass := true
 
     ReadExternalGamepads()
-    
+
     MouseGetPos, currentX, currentY
     MouseState.X := currentX, MouseState.Y := currentY
-
-    if (AHIMouseTranslation)
-        UpdateAHIMousePhysics()
 
     UpdateAllVirtualAxes()
     UpdateDigitalButtons()
     PadFlush()
-    
-    if (AHIMouseTranslation)
-        ApplyAHISpringReturn()
 
     EnforceMouseLockAndCursor()
     MouseState.SteeringActive := SteerKey.Down
@@ -968,7 +1015,7 @@ GetClientBounds(hwnd, ByRef x, ByRef y, ByRef w, ByRef h) {
 
 UpdateActiveWindowBounds() {
     global AppState, WindowState, Rect, EnableVerticalLine, Cursors, ActiveGameHWND
-    
+
     if (AppState.RunAlways) {
         nWx := 0, nWy := 0, nWw := A_ScreenWidth, nWh := A_ScreenHeight
     } else if (ActiveGameHWND) {
@@ -982,47 +1029,10 @@ UpdateActiveWindowBounds() {
         WindowState.X := nWx, WindowState.Y := nWy, WindowState.W := nWw, WindowState.H := nWh
         NumPut(nWx, Rect, 0, "Int"), NumPut(nWy, Rect, 4, "Int")
         NumPut(nWx + nWw, Rect, 8, "Int"), NumPut(nWy + nWh, Rect, 12, "Int")
-        
+
         if (EnableVerticalLine && Cursors.VertVisible)
             Gui, 2:Show, % "x0 y0 w3 h" . nWh . " NoActivate", VertLine
     }
-}
-
-UpdateAHIMousePhysics() {
-    global AHIMouse, MouseTranslationAxisX_Mult, MouseTranslationAxisY_Mult, MouseTranslationSensitivity, MouseTranslationDecay, CLTimer
-    
-    Critical, On
-    rawDeltaX := AHIMouse.DeltaX
-    rawDeltaY := AHIMouse.DeltaY
-    AHIMouse.DeltaX := 0
-    AHIMouse.DeltaY := 0
-    Critical, Off
-
-    static freq := 0
-    if (!freq)
-        DllCall("QueryPerformanceFrequency", "Int64*", freq)
-    DllCall("QueryPerformanceCounter", "Int64*", now)
-    dt := AHIMouse.LastTick ? (now - AHIMouse.LastTick) * 1000 / freq : CLTimer
-    AHIMouse.LastTick := now
-    if (dt < 1)
-        dt := 1
-
-    normFactor := CLTimer / dt
-    velX := rawDeltaX * normFactor * MouseTranslationAxisX_Mult
-    velY := (rawDeltaY * -1) * normFactor * MouseTranslationAxisY_Mult
-
-    targetX := velX * MouseTranslationSensitivity * 3.0
-    targetY := velY * MouseTranslationSensitivity * 3.0
-
-    decayStep := MouseTranslationDecay ** (dt / CLTimer)
-    AHIMouse.StickX := (rawDeltaX != 0) ? targetX : AHIMouse.StickX * decayStep
-    AHIMouse.StickY := (rawDeltaY != 0) ? targetY : AHIMouse.StickY * decayStep
-
-    AHIMouse.StickX := Max(-255, Min(255, AHIMouse.StickX))
-    AHIMouse.StickY := Max(-255, Min(255, AHIMouse.StickY))
-    
-    AHIMouse.RawDeltaX := rawDeltaX
-    AHIMouse.RawDeltaY := rawDeltaY
 }
 
 UpdateAllVirtualAxes() {
@@ -1050,12 +1060,42 @@ UpdateAllVirtualAxes() {
 }
 
 IsAnyKeyDown(keys) {
-    global AHI_DigiState
     for _, k in keys {
-        if (KeyIsDown(k))
+        if (Core_KeyDown(k))
             return true
     }
     return false
+}
+
+; Physical key state for the controller mapping. GetKeyState misses keys that an ahiS_ function currently hides from the OS,
+; so those are also looked up in the physical state AHI reported (AhiPhysN, kept by Core_AhiEvent for every subscribed key).
+Core_KeyDown(k) {
+    global AhiOn, AhiPhysN, AhiKeyCache, AhiKeySeen
+    if (GetKeyState(k, "P"))
+        return true
+    if (!AhiOn)
+        return false
+    if (!AhiKeyCache.HasKey(k)) {
+        slots := Core_AhiSlots(k, kerr)
+        keys := []
+        if (IsObject(slots)) {
+            for _, sl in slots {
+                if (sl.Type != "w")
+                    keys.Push(sl.Key)
+            }
+        }
+        AhiKeyCache[k] := keys
+    }
+    seen := false
+    for _, sk in AhiKeyCache[k] {
+        if (AhiPhysN[sk] > 0)
+            seen := true
+    }
+    if (seen != (AhiKeySeen[k] ? true : false)) {
+        AhiKeySeen[k] := seen
+        Core_AhiLog("mapper sees " . k . " via AHI = " . (seen ? 1 : 0))
+    }
+    return seen
 }
 
 UpdateDigitalButtons() {
@@ -1103,7 +1143,7 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
     extX := ExtPadState[axisX]
     extY := ExtPadState[axisY]
     extMag := Sqrt((extX * extX) + (extY * extY))
-    
+
     if (extMag > ExtStickDeadzone && extMag > 0) {
         clampedExtMag := (extMag > 255) ? 255 : extMag
         extNorm := (clampedExtMag - ExtStickDeadzone) * MathVars.ExtS_Mult
@@ -1117,31 +1157,31 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
         isMouseX := (axisX == MouseSteeringAxisX)
         isMouseY := (axisY == MouseSteeringAxisY)
         mouseXPress := 0, mouseYPress := 0
-        
+
         if (isMouseX && !DigiOverride[axisX]) {
             distX := MouseState.X - ScreenCenter.x
             absDistX := Abs(distX)
             if (absDistX > MathVars.MaxDist)
                 absDistX := MathVars.MaxDist
-            
+
             if (absDistX > MathVars.MS_DeadzonePixels) {
                 signX := (distX < 0) ? -1 : 1
                 mouseXPress := (absDistX - MathVars.MS_DeadzonePixels) * MathVars.MousePressureMult * MouseSteeringAxisX_Mult * signX
             }
         }
-        
+
         if (isMouseY && !DigiOverride[axisY]) {
             distY := ScreenCenter.y - MouseState.Y
             absDistY := Abs(distY)
             if (absDistY > MathVars.MaxDist)
                 absDistY := MathVars.MaxDist
-            
+
             if (absDistY > MathVars.MS_DeadzonePixels) {
                 signY := (distY < 0) ? -1 : 1
                 mouseYPress := (absDistY - MathVars.MS_DeadzonePixels) * MathVars.MousePressureMult * MouseSteeringAxisY_Mult * signY
             }
         }
-        
+
         if (AnalogSupersedesMouse) {
             if (x == 0 && isMouseX)
                 x := mouseXPress
@@ -1165,21 +1205,21 @@ ApplyRadialStick(ByRef x, ByRef y, axisX, axisY) {
     mag := Sqrt((x * x) + (y * y))
     if (mag == 0)
         return
-    
+
     normMag := mag / 255.0
     if (normMag > 1.0)
         normMag := 1.0
-    
+
     lin := Linearity_Calc[axisX]
     adz_raw := ADZ_Calc[axisX].Raw
     adz_scale := ADZ_Calc[axisX].Scale
-    
+
     if (lin != 1.0)
         normMag := normMag ** lin
-    
+
     if (adz_raw > 0)
         normMag := (adz_raw / 255.0) + (normMag * adz_scale)
-    
+
     newMag := normMag * 255.0
     x := Round((x / mag) * newMag)
     y := Round((y / mag) * newMag)
@@ -1219,14 +1259,13 @@ DeadzoneMult(dz) {
 CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
     global ScreenCenter, MouseState, MathVars, LX_D_MovesMouse, WootingDeadzone, ExtTriggerDeadzone
     global ExtPadState, WootingEnabled, MouseSteeringAxisX, sw
-    global MouseSteeringAxisX_Mult, AHIMouse, AHIMouseTranslation, MouseTranslationAxisX, MouseTranslationAxisY, AHI_DigiState
-    global DigiOverride
-    
+    global MouseSteeringAxisX_Mult, DigiOverride
+
     pressure := 0
     DigiOverride[axis] := false
-    
+
     for _, pair in dArray {
-        if (KeyIsDown(pair[1])) {
+        if (Core_KeyDown(pair[1])) {
             pressure := pair[2]
             if (isStick && axis == MouseSteeringAxisX && LX_D_MovesMouse) {
                 signX := MouseSteeringAxisX_Mult < 0 ? -1 : 1
@@ -1237,7 +1276,7 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
             return pressure
         }
     }
-    
+
     for key, value in aArray {
         rawVal := 0
         if (WootingEnabled)
@@ -1246,7 +1285,7 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
             rawVal := (rawVal <= WootingDeadzone) ? 0 : (rawVal - WootingDeadzone) * MathVars.WD_Mult
         pressure += rawVal * value
     }
-        
+
     if (!isStick) {
         rawExt := ExtPadState[axis]
         if (ExtTriggerDeadzone > 0)
@@ -1254,14 +1293,7 @@ CalcVirtualPressure(axis, isStick, ByRef dArray, ByRef aArray) {
         else
             pressure += rawExt
     }
-        
-    if (AHIMouseTranslation && isStick) {
-        if (axis == MouseTranslationAxisX)
-            pressure += AHIMouse.StickX
-        else if (axis == MouseTranslationAxisY)
-            pressure += AHIMouse.StickY
-    }
-    
+
     return pressure
 }
 
@@ -1303,14 +1335,6 @@ PadFlush() {
     }
 }
 
-ApplyAHISpringReturn() {
-    global AHIMouse
-    if (AHIMouse.RawDeltaX == 0 && Abs(AHIMouse.StickX) < 1.0)
-        AHIMouse.StickX := 0
-    if (AHIMouse.RawDeltaY == 0 && Abs(AHIMouse.StickY) < 1.0)
-        AHIMouse.StickY := 0
-}
-
 EnforceMouseLockAndCursor() {
     global EnableMouseLock, EnableCursorReplacement, EnableVerticalLine
     global pGetClipCursor, pClipCursor, pSetSystemCursor, pCopyImage, pSetWindowPos, pSystemParametersInfo
@@ -1323,7 +1347,7 @@ EnforceMouseLockAndCursor() {
         if (NumGet(CurrentClip, 0, "Int") != WindowState.X || NumGet(CurrentClip, 4, "Int") != WindowState.Y || NumGet(CurrentClip, 8, "Int") != WindowState.X + WindowState.W || NumGet(CurrentClip, 12, "Int") != WindowState.Y + WindowState.H) {
             DllCall(pClipCursor, "Ptr", &Rect)
             if (EnableCursorReplacement)
-                Cursors.ForceHide := True 
+                Cursors.ForceHide := True
         }
         WindowState.Locked := true
     } else if (WindowState.Locked) {
@@ -1371,14 +1395,6 @@ DeactivateMouseSteering() {
     global SteerKey
     SteerKey.Down := false
 }
-ActivateMouseTranslation() {
-    global AHIMouseTranslation
-    AHIMouseTranslation := true
-}
-DeactivateMouseTranslation() {
-    global AHIMouseTranslation
-    AHIMouseTranslation := false
-}
 ActivateController() {
     global ControllerActive, lastAxisState, pad
     global lastButtonState, lastDpadState
@@ -1400,189 +1416,6 @@ DeactivateController() {
         pad.Buttons[btn].SetState(0)
     pad.Dpad.SetState("None")
     pad.SendReport()
-}
-
-; === DYNAMIC INTERCEPTION HANDLERS ===
-; The handler for a key is looked up per event from the ACTIVE block. If the active block has no handler
-; (and doesn't $-swallow the key), the event is passed through untouched.
-; AHI_DigiState[name] is the tracked physical state of every intercepted key, updated on every event (swallowed or not).
-; OSDown[name]: the OS has seen this key/button go down and not yet up. A suppressed release must still
-; reach the OS in that case (key was already held when suppression began), or it would stay stuck.
-Core_DynamicKeyHandler(keyName, sc, kId, state) {
-    global ahi, AHI_DigiState, OSDown, AHITrace
-    Critical, On
-    AHI_DigiState[keyName] := state
-    handled := Core_Dispatch(keyName, fn)
-    if (AHITrace)
-        Core_Trace("K", keyName, kId, state, handled)
-    if (handled) {
-        if (!state && OSDown[keyName]) {
-            OSDown[keyName] := false
-            ahi.SendKeyEvent(kId, sc, 0)
-        }
-        Critical, Off
-        if (fn)
-            fn.Call(state)
-    } else {
-        OSDown[keyName] := state ? true : false
-        ahi.SendKeyEvent(kId, sc, state)
-    }
-}
-
-Core_DynamicMouseBtnHandler(btnName, btnId, mId, state) {
-    global ahi, AHI_DigiState, OSDown, AHITrace
-    Critical, On
-    AHI_DigiState[btnName] := state
-    handled := Core_Dispatch(btnName, fn)
-    if (AHITrace)
-        Core_Trace("B", btnName, mId, state, handled)
-    if (handled) {
-        if (!state && OSDown[btnName]) {
-            OSDown[btnName] := false
-            ahi.SendMouseButtonEvent(mId, btnId, 0)
-        }
-        Critical, Off
-        if (fn)
-            fn.Call(state)
-    } else {
-        OSDown[btnName] := state ? true : false
-        ahi.SendMouseButtonEvent(mId, btnId, state)
-    }
-}
-
-Core_DynamicMouseWheelHandler(btnName, btnId, mId, direction) {
-    global ahi
-    if (Core_Dispatch(btnName, fn)) {
-        if (fn)
-            fn.Call(direction)
-    } else {
-        ahi.SendMouseButtonEvent(mId, btnId, direction)
-    }
-}
-
-Core_Trace(kind, name, dev, state, handled) {
-    global ScriptDir
-    FileAppend, % A_TickCount . "," . kind . "," . name . "," . dev . "," . state . "," . handled . "`n", %ScriptDir%\$MapperConfigs\.ahi_trace.log
-}
-
-; Down state of a key/button. For intercepted ones AHI_DigiState is the only truth: AHK's own physical state is
-; not updated while AHI blocks the events, so it can be left stale.
-KeyIsDown(k) {
-    global AHI_DigiState
-    return AHI_DigiState.HasKey(k) ? AHI_DigiState[k] : GetKeyState(k, "P")
-}
-
-; Returns 1 if the active block handles keyName (fn = handler function, or empty for a $-swallow), else 0
-Core_Dispatch(keyName, ByRef fn) {
-    global Blocks, ActiveBlockIdx, PrependSubOrigin
-    fn := ""
-    if (ActiveBlockIdx <= 0)
-        return 0
-    if (PrependSubOrigin) {
-        fn := Func("O" . PrependSubOrigin . "_ahiS_" . keyName)
-        if (fn)
-            return 1
-    }
-    blk := Blocks[ActiveBlockIdx]
-    if (blk.SubOrigin) {
-        fn := Func("O" . blk.SubOrigin . "_ahiS_" . keyName)
-        if (fn)
-            return 1
-    }
-    return blk.Swallow.HasKey(keyName) ? 1 : 0
-}
-
-; Makes the set of AHI subscriptions match what the active block (plus Prepend) handles. Called on every block change.
-Core_SyncAHI() {
-    global ahi, EnableAHI, Blocks, ActiveBlockIdx, AHISubs, KeysToScan, MouseButtons
-    if (!EnableAHI || !IsObject(ahi))
-        return
-    want := {}
-    if (ActiveBlockIdx > 0) {
-        fn := ""
-        for _, kn in KeysToScan {
-            if (Core_Dispatch(kn, fn))
-                want["K:" . kn] := kn
-        }
-        for bn in MouseButtons {
-            if (Core_Dispatch(bn, fn))
-                want["B:" . bn] := bn
-        }
-        if (Core_Dispatch("Wheel", fn))
-            want["W:Wheel"] := "Wheel"
-        if (Core_Dispatch("HWheel", fn))
-            want["W:HWheel"] := "HWheel"
-        if (Blocks[ActiveBlockIdx].UsesTranslation)
-            want["M:Move"] := "Move"
-    }
-    drop := []
-    for tag, name in AHISubs {
-        if (!want.HasKey(tag))
-            drop.Push(tag)
-    }
-    for _, tag in drop {
-        Core_AHIUnsub(tag, AHISubs[tag])
-        AHISubs.Delete(tag)
-    }
-    for tag, name in want {
-        if (AHISubs.HasKey(tag))
-            continue
-        Core_AHISub(tag, name)
-        AHISubs[tag] := name
-    }
-}
-
-Core_AHISub(tag, name) {
-    global ahi, AHIKbd, AHIMice, MouseButtons, OSDown, AHI_DigiState
-    kind := SubStr(tag, 1, 1)
-    if (kind == "K") {
-        sc := GetKeySC(name)
-        if (!sc)
-            return
-        down := GetKeyState(name, "P") ? 1 : 0
-        for _, id in AHIKbd
-            ahi.SubscribeKey(id, sc, true, Func("Core_DynamicKeyHandler").Bind(name, sc, id), true)
-        AHI_DigiState[name] := down
-        OSDown[name] := down
-    } else if (kind == "B") {
-        btnId := MouseButtons[name]
-        down := GetKeyState(name, "P") ? 1 : 0
-        for _, id in AHIMice
-            ahi.SubscribeMouseButton(id, btnId, true, Func("Core_DynamicMouseBtnHandler").Bind(name, btnId, id), true)
-        AHI_DigiState[name] := down
-        OSDown[name] := down
-    } else if (kind == "W") {
-        btnId := (name == "Wheel") ? 5 : 6
-        for _, id in AHIMice
-            ahi.SubscribeMouseButton(id, btnId, true, Func("Core_DynamicMouseWheelHandler").Bind(name, btnId, id), true)
-    } else {
-        for _, id in AHIMice
-            ahi.SubscribeMouseMoveRelative(id, true, Func("Core_ahiOnMouseMoveRelative").Bind(id))
-    }
-}
-
-Core_AHIUnsub(tag, name) {
-    global ahi, AHIKbd, AHIMice, MouseButtons, OSDown, AHI_DigiState
-    kind := SubStr(tag, 1, 1)
-    if (kind == "K") {
-        sc := GetKeySC(name)
-        for _, id in AHIKbd
-            ahi.UnsubscribeKey(id, sc)
-        AHI_DigiState.Delete(name)
-        OSDown.Delete(name)
-    } else if (kind == "B") {
-        for _, id in AHIMice
-            ahi.UnsubscribeMouseButton(id, MouseButtons[name])
-        AHI_DigiState.Delete(name)
-        OSDown.Delete(name)
-    } else if (kind == "W") {
-        btnId := (name == "Wheel") ? 5 : 6
-        for _, id in AHIMice
-            ahi.UnsubscribeMouseButton(id, btnId)
-    } else {
-        for _, id in AHIMice
-            ahi.UnsubscribeMouseMoveRelative(id)
-    }
 }
 
 ; === BLOCK SELECTION & PROFILE LOADING ===
@@ -1648,7 +1481,7 @@ Core_ResolveBlockIdx() {
 ; the existing FocusLost() reset still happens when no block is active at all.
 Core_SelectBlock() {
     global Blocks, ActiveBlockIdx, ActiveSubOrigin, AppState, EnableMouseLock, EnableVerticalLine
-    global ActiveGroupIdx, SteerKey, StartupMouseSteering, AHIMouseTranslation, StartupMouseTranslation, PrependAutoOrigin
+    global ActiveGroupIdx, SteerKey, StartupMouseSteering, PrependAutoOrigin
     static prevGroup := 0
     newIdx := Core_ResolveBlockIdx()
     if (newIdx == ActiveBlockIdx)
@@ -1665,11 +1498,11 @@ Core_SelectBlock() {
         AppState.IsGameActive := false
     }
     Critical, Off
+    Core_AhiSync()
     if (newIdx > 0) {
         ResetControllerState()
         if (prevGroup && ActiveGroupIdx != prevGroup) {
             SteerKey.Down := StartupMouseSteering
-            AHIMouseTranslation := StartupMouseTranslation
         }
         prevGroup := ActiveGroupIdx
         if (EnableMouseLock || EnableVerticalLine)
@@ -1677,7 +1510,6 @@ Core_SelectBlock() {
         Core_RunAutoexec(PrependAutoOrigin)
         Core_RunAutoexec(blk.AutoOrigin)
     }
-    Core_SyncAHI()
 }
 
 ; Each distinct [CustomAutoexecute] text runs once, in its own thread, the first time a block using it activates
@@ -1736,16 +1568,6 @@ Core_BuildProfile(blk) {
     p.RunAlways := blk.RunAlways ? true : false
 
     p.StartupMouseSteering := Core_Num(S, "StartupMouseSteering", 0, 0, 1)
-    p.StartupMouseTranslation := Core_Num(S, "StartupMouseTranslation", 0, 0, 1)
-
-    t := ParseAxisAndMult(Core_Get(S, "MouseTranslationAxisX", "RX"))
-    p.MouseTranslationAxisX := t.Axis
-    p.MouseTranslationAxisX_Mult := t.Mult
-    t := ParseAxisAndMult(Core_Get(S, "MouseTranslationAxisY", "RY"))
-    p.MouseTranslationAxisY := t.Axis
-    p.MouseTranslationAxisY_Mult := t.Mult
-    p.MouseTranslationSensitivity := Core_Num(S, "MouseTranslationSensitivity", 15.0, 0, "")
-    p.MouseTranslationDecay := Core_Num(S, "MouseTranslationDecay", 0.75, 0.01, 0.999)
 
     t := ParseAxisAndMult(Core_Get(S, "MouseSteeringAxisX", "LX"))
     p.MouseSteeringAxisX := t.Axis
@@ -1753,8 +1575,6 @@ Core_BuildProfile(blk) {
     t := ParseAxisAndMult(Core_Get(S, "MouseSteeringAxisY", "None"))
     p.MouseSteeringAxisY := t.Axis
     p.MouseSteeringAxisY_Mult := t.Mult
-    Core_CheckAxis(p.MouseTranslationAxisX, "MouseTranslationAxisX")
-    Core_CheckAxis(p.MouseTranslationAxisY, "MouseTranslationAxisY")
     Core_CheckAxis(p.MouseSteeringAxisX, "MouseSteeringAxisX")
     Core_CheckAxis(p.MouseSteeringAxisY, "MouseSteeringAxisY")
 
@@ -1823,13 +1643,6 @@ Core_ApplyProfile(p) {
     global
     AppState.RunAlways := p.RunAlways
     StartupMouseSteering := p.StartupMouseSteering
-    StartupMouseTranslation := p.StartupMouseTranslation
-    MouseTranslationAxisX := p.MouseTranslationAxisX
-    MouseTranslationAxisX_Mult := p.MouseTranslationAxisX_Mult
-    MouseTranslationAxisY := p.MouseTranslationAxisY
-    MouseTranslationAxisY_Mult := p.MouseTranslationAxisY_Mult
-    MouseTranslationSensitivity := p.MouseTranslationSensitivity
-    MouseTranslationDecay := p.MouseTranslationDecay
     MouseSteeringAxisX := p.MouseSteeringAxisX
     MouseSteeringAxisX_Mult := p.MouseSteeringAxisX_Mult
     MouseSteeringAxisY := p.MouseSteeringAxisY
@@ -1868,6 +1681,8 @@ Core_ApplyProfile(p) {
 ReadExternalGamepads() {
     global ExternalGamepads, ExtPadState, pXInputGetState, CONST
     static XINPUT_STATE
+    if (!ExternalGamepads.Length())
+        return
     if !VarSetCapacity(XINPUT_STATE)
         VarSetCapacity(XINPUT_STATE, 16, 0)
 
@@ -1882,17 +1697,16 @@ ReadExternalGamepads() {
                 ExtPadState.LY := Round(NumGet(XINPUT_STATE, 10, "Short") * CONST.READ_MULT)
                 ExtPadState.RX := Round(NumGet(XINPUT_STATE, 12, "Short") * CONST.READ_MULT)
                 ExtPadState.RY := Round(NumGet(XINPUT_STATE, 14, "Short") * CONST.READ_MULT)
-                break 
+                break
             }
         }
     }
 }
 
-; Lifts every virtual axis, button and the dpad, and clears the mouse-translation stick. Cached states are zeroed,
+; Lifts every virtual axis, button and the dpad. Cached states are zeroed,
 ; so inputs that are still held are re-applied on the next tick.
 ResetControllerState() {
-    global lastAxisState, lastButtonState, lastDpadState, pad, PadDirty, AHIMouse
-    AHIMouse.DeltaX := 0, AHIMouse.DeltaY := 0, AHIMouse.StickX := 0, AHIMouse.StickY := 0, AHIMouse.LastTick := 0
+    global lastAxisState, lastButtonState, lastDpadState, pad, PadDirty
     for axis in lastAxisState {
         lastAxisState[axis] := 0
         pad.Axes[axis].SetState(0)
@@ -1908,9 +1722,8 @@ ResetControllerState() {
 }
 
 FocusLost() {
-    global SteerKey, AHI_DigiState
+    global SteerKey
     ResetControllerState()
-    AHI_DigiState := {}
     SteerKey.Down := false
     CleanupMouseLockAndHide()
 }
@@ -1935,13 +1748,12 @@ CleanupMouseLockAndHide() {
 }
 
 CleanUp() {
+    global pClipCursor, pSystemParametersInfo, pDestroyCursor, BlankCursor, hXInput, sw, WootingEnabled, SPI_SETCURSORS, pidFile, corePid
     DllCall("winmm\timeEndPeriod", "UInt", 1)
-    global ahi, EnableAHI, pClipCursor, pSystemParametersInfo, pDestroyCursor, BlankCursor, hXInput, sw, WootingEnabled, SPI_SETCURSORS, pidFile, corePid
+    Core_AhiShutdown()
     FileRead, curPid, %pidFile%
     if (Trim(curPid) = corePid)
         FileDelete, %pidFile%
-    if (EnableAHI && IsObject(ahi))
-        ahi.Dispose()
     if (WootingEnabled && IsObject(sw))
         sw.Close()
     DllCall(pClipCursor, "Ptr", 0)
@@ -1970,8 +1782,6 @@ ParseAnalog(iniStr) {
             Core_Warn("Bad analog multiplier in '" . Trim(A_LoopField) . "'.")
             continue
         }
-        if (SubStr(k, 1, 1) == "$")
-            k := SubStr(k, 2)
         obj[k] := mult + 0.0
     }
     return obj
@@ -1995,8 +1805,6 @@ ParseDigital(iniStr) {
             Core_Warn("Bad digital value in '" . Trim(A_LoopField) . "'.")
             continue
         }
-        if (SubStr(k, 1, 1) == "$")
-            k := SubStr(k, 2)
         arr.Push([k, Max(-100, Min(100, val + 0.0)) * 2.55])
     }
     return arr
@@ -2009,20 +1817,9 @@ ParseKeyList(iniStr) {
     Loop, Parse, iniStr, `,
     {
         k := Trim(A_LoopField)
-        if (SubStr(k, 1, 1) == "$")
-            k := SubStr(k, 2)
         if (k != "")
             arr.Push(k)
     }
-    return arr
-}
-
-ParseArray(iniStr) {
-    arr := []
-    if (iniStr == "" || iniStr == "ERROR")
-        return arr
-    Loop, Parse, iniStr, `,
-        arr.Push(Trim(A_LoopField))
     return arr
 }
 
@@ -2045,13 +1842,463 @@ ParseAxisAndMult(iniStr) {
     return {Axis: axis, Mult: mult}
 }
 
-Core_ahiOnMouseMoveRelative(mId, x, y) {
-    global AppState, AHIMouse, AHIMouseTranslation, ahi
-    if (AppState.IsGameActive && AHIMouseTranslation) {
-        AHIMouse.DeltaX += x
-        AHIMouse.DeltaY += y
-    } else {
-        ahi.SendMouseMoveRelative(mId, x, y)
+; === Wheel -> key tap (ahiS_wheel:: / ahiS_hwheel:: shorthand) ===
+; AHI runs its callbacks strictly one after another, so a callback that blocks (Send / Critical / Sleep / timer set-up)
+; stalls every subscribed key and the wheel. Therefore the callback (Core_WheelNotch) only counts the notch and returns;
+; the keys are sent by Core_WheelPoll, a ~4 ms timer in its own thread. One state object (st) per binding.
+; Phase: 0 idle, 1 key held, 2 end wait (key already up). A running tap always finishes (hold, then wait). A notch while
+; busy goes into ONE queue slot (Pending = direction; extra notches only refresh it, so there is never a backlog).
+Core_WheelNotch(st, isFirst, k1, k2, h1, h2, wait) {
+    global WheelStates
+    if (!st.Reg) {
+        st.K1 := k1, st.K2 := k2, st.H1 := h1, st.H2 := h2, st.Wait := wait
+        st.Reg := true
+        WheelStates.Push(st)
+    }
+    st.Dir := isFirst ? 1 : 2
+    st.Notch += 1
+}
+
+Core_WheelPoll() {
+    global WheelStates
+    SetKeyDelay, -1, -1
+    Loop, % WheelStates.Length()
+    {
+        st := WheelStates[A_Index]
+        n := st.Notch
+        cnt := n - st.Seen
+        st.Seen := n
+        dir := st.Dir
+
+        ; 1. advance the running tap: hold -> release -> end wait -> idle
+        if (st.Phase == 1 && A_TickCount >= st.Due) {
+            Send, % "{" . st.Key . " up}"
+            if (st.Wait > 0) {
+                st.Phase := 2
+                st.Due := A_TickCount + st.Wait
+            } else {
+                st.Phase := 0
+            }
+        }
+        if (st.Phase == 2 && A_TickCount >= st.Due)
+            st.Phase := 0
+
+        ; 2. the queued tap goes first, as soon as idle
+        if (st.Phase == 0 && st.Pending) {
+            Core_WheelStart(st, st.Pending)
+            st.Pending := 0
+        }
+
+        ; 3. new notches: start now when idle, otherwise keep ONE in the queue slot (latest direction wins)
+        if (cnt > 0) {
+            if (st.Phase == 0) {
+                Core_WheelStart(st, dir)
+                cnt -= 1
+            }
+            if (cnt > 0)
+                st.Pending := dir
+        }
+    }
+}
+
+; Press the key for direction d (1 = key 1 / wheel up, 2 = key 2 / wheel down); Core_WheelPoll releases it after its hold
+Core_WheelStart(st, d) {
+    st.Key := (d == 1) ? st.K1 : st.K2
+    Send, % "{" . st.Key . " down}"
+    st.Phase := 1
+    st.Due := A_TickCount + Max(1, (d == 1) ? st.H1 : st.H2)
+}
+
+; Exit: lift any wheel-tap key still held
+Core_WheelRelease() {
+    global WheelStates
+    SetKeyDelay, -1, -1
+    for _, st in WheelStates {
+        if (st.Phase == 1)
+            Send, % "{" . st.Key . " up}"
+        st.Phase := 0
+        st.Pending := 0
+    }
+}
+
+; === AutoHotInterception (ahiS_ functions) ===
+; While a key is subscribed (block = true) AHI swallows both its down and its up. So a press must belong to ONE side
+; from its first down to its last up, otherwise the OS (and AutoHotkey's hook) is left with a down that never gets its up
+; and the key is dead everywhere. Rules that guarantee this:
+;  - A key is only subscribed while it is physically up, and only unsubscribed after it was physically released.
+;    A key held while its block deactivates stays hidden until released; the target still gets start = 0 immediately.
+;    A key already held when its block activates is simply left alone until released.
+;  - Subscription changes are skipped while AHI events are in flight (a short quiet gap is required).
+;  - Each device/key press is tracked (Held): auto-repeat is dropped, orphans (stopped, still physically down) are swallowed.
+; Startup: enumerate every HID keyboard and mouse, resolve each ahiS_ key to scan-code / button slots, build one
+; binding per function. Core_AhiSync only decides what SHOULD be live; Core_AhiReconcile (CoreLoop) makes it so.
+Core_AhiInit(defs) {
+    global AHI, AhiOn, AhiKeyboards, AhiMice, AhiByOrigin, AhiAll
+    if (!IsObject(defs) || defs.Length() == 0)
+        return
+    try {
+        AHI := new AutoHotInterception()
+        devs := AHI.GetDeviceList()
+    } catch e {
+        Core_Warn("AutoHotInterception could not start: " . e.Message)
+        return
+    }
+    for id, dev in devs {
+        if (dev.IsMouse)
+            AhiMice.Push(id)
+        else
+            AhiKeyboards.Push(id)
+    }
+    if (AhiKeyboards.Length() == 0 && AhiMice.Length() == 0) {
+        Core_Warn("AutoHotInterception found no keyboards or mice; ahiS_ functions are inactive.")
+        return
+    }
+    seen := {}
+    for _, d in defs {
+        slots := Core_AhiSlots(d.Key, err)
+        if (!IsObject(slots)) {
+            Core_Warn("ahiS_" . d.Key . ": " . err)
+            continue
+        }
+        fn := Func(d.Func)
+        if (!fn)
+            continue
+        uniq := []
+        for _, s in slots {
+            sk := d.Origin . ":" . s.Key
+            if (seen.HasKey(sk)) {
+                Core_Warn("ahiS_" . d.Key . " shares a physical key with ahiS_" . seen[sk] . " in the same block; the first one is used.")
+                continue
+            }
+            seen[sk] := d.Key
+            uniq.Push(s)
+        }
+        if (uniq.Length() == 0)
+            continue
+        b := {Id: AhiAll.Length() + 1, Fn: fn, Key: d.Key, Origin: d.Origin, Slots: uniq, Held: {}, Count: 0, WantKeys: {}}
+        AhiAll.Push(b)
+        if (!AhiByOrigin.HasKey(d.Origin))
+            AhiByOrigin[d.Origin] := []
+        AhiByOrigin[d.Origin].Push(b)
+    }
+    AhiOn := true
+    pollFn := Func("Core_WheelPoll")
+    SetTimer, % pollFn, 4
+    Core_AhiLog("init: keyboards=" . AhiKeyboards.Length() . " mice=" . AhiMice.Length() . " bindings=" . AhiAll.Length())
+}
+
+; ahiS_ key name -> [slot]. A slot is {Type "k"|"m"|"w", Code, Key, Name, Sub, Ids, Fail}: keyboard Code is AHK's scan code
+; (extended keys 0x1xx, the form AutoHotInterception uses), mouse Code is the AHI button index, "w" is a wheel (Code 5
+; vertical / 6 horizontal, mouse devices, no held state); Name is what GetKeyState
+; understands; Sub / Ids / Fail track the live AHI subscription. On failure returns "" and sets err.
+Core_AhiSlots(name, ByRef err) {
+    static mouseBtn := {lbutton: 0, rbutton: 1, mbutton: 2, xbutton1: 3, xbutton2: 4}
+    static mouseName := ["LButton", "RButton", "MButton", "XButton1", "XButton2"]
+    static generics := {shift: ["LShift", "RShift"], ctrl: ["LControl", "RControl"], control: ["LControl", "RControl"]
+        , alt: ["LAlt", "RAlt"], win: ["LWin", "RWin"]}
+    static aliases := {comma: ",", period: ".", dot: ".", semicolon: ";", slash: "/", backslash: "\", minus: "-"
+        , equals: "=", apostrophe: "'", quote: "'", backtick: "``", grave: "``"
+        , leftbracket: "[", rightbracket: "]", lbracket: "[", rbracket: "]"}
+    err := ""
+    low := name
+    StringLower, low, low
+    if (low == "wheel" || low == "hwheel") {
+        ; AHI mouse "buttons" 5 (vertical) and 6 (horizontal); state is 1 = up / right, -1 = down / left
+        code := (low == "wheel") ? 5 : 6
+        return [{Type: "w", Code: code, Key: "w" . code, Name: "", Sub: false, Ids: [], Fail: 0}]
+    }
+    if (low == "wheelup" || low == "wheeldown" || low == "wheelleft" || low == "wheelright") {
+        err := "use ahiS_wheel(up) or ahiS_hwheel(up) to catch the wheel."
+        return ""
+    }
+    if (mouseBtn.HasKey(low)) {
+        code := mouseBtn[low]
+        return [{Type: "m", Code: code, Key: "m" . code, Name: mouseName[code + 1], Sub: false, Ids: [], Fail: 0}]
+    }
+    names := generics.HasKey(low) ? generics[low] : [aliases.HasKey(low) ? aliases[low] : name]
+    slots := []
+    for _, n in names {
+        sc := GetKeySC(n)
+        if (!sc) {
+            err := "'" . name . "' is not a keyboard key or mouse button AutoHotkey can hold (joystick is not supported)."
+            return ""
+        }
+        slots.Push({Type: "k", Code: sc, Key: "k" . sc, Name: "sc" . Format("{:03X}", sc), Sub: false, Ids: [], Fail: 0})
+    }
+    return slots
+}
+
+; Decides which keys of which bindings SHOULD be live (active block + Prepend). Called when the active block changes.
+; Anything held that is no longer wanted is released toward the target right away (start = 0) but stays hidden.
+Core_AhiSync() {
+    global AhiOn, AhiAll, AhiByOrigin, AhiDirty, ActiveBlockIdx, ActiveSubOrigin, PrependSubOrigin
+    if (!AhiOn)
+        return
+    fresh := {}
+    owned := {}
+    if (ActiveBlockIdx > 0) {
+        origins := [PrependSubOrigin]
+        if (ActiveSubOrigin != PrependSubOrigin)
+            origins.Push(ActiveSubOrigin)
+        for _, o in origins {
+            if (!o || !AhiByOrigin.HasKey(o))
+                continue
+            for _, b in AhiByOrigin[o] {
+                keys := {}
+                for _, s in b.Slots {
+                    if (owned.HasKey(s.Key))
+                        continue
+                    owned[s.Key] := 1
+                    keys[s.Key] := 1
+                }
+                fresh[b.Id] := keys
+            }
+        }
+    }
+    for _, b in AhiAll {
+        b.WantKeys := fresh.HasKey(b.Id) ? fresh[b.Id] : {}
+        Core_AhiOrphan(b)
+    }
+    AhiDirty := true
+    Core_AhiLog("sync: block=" . ActiveBlockIdx . " origin=" . ActiveSubOrigin)
+}
+
+; Held entries: 1 = press owned by the handler (counted), 2 = orphan (stopped or never started; swallowed until its up).
+Core_AhiOrphan(b) {
+    crit := A_IsCritical
+    Critical, On
+    stop := false
+    for hk, v in b.Held {
+        if (v != 1)
+            continue
+        if (b.WantKeys.HasKey(SubStr(hk, 1, InStr(hk, "@") - 1)))
+            continue
+        b.Held[hk] := 2
+        b.Count -= 1
+        if (b.Count == 0)
+            stop := true
+    }
+    Critical, %crit%
+    if (stop) {
+        Core_AhiLog("orphan: ahiS_" . b.Key . " released (start=0), key stays hidden until physically up")
+        Core_AhiCall(b, 0)
+    }
+}
+
+; Runs from CoreLoop while AhiDirty. Subscribes wanted slots whose key is physically up and no other binding holds,
+; unsubscribes unwanted slots once nothing of theirs is held. Stays dirty while anything is still waiting.
+Core_AhiReconcile() {
+    global AhiAll, AhiOwner, AhiDirty, AhiLastEvt
+    if (A_TickCount - AhiLastEvt < 30)
+        return                                  ; events in flight: touching AHI now is what races
+    pending := false
+    for _, b in AhiAll {
+        for _, s in b.Slots {
+            wanted := b.WantKeys.HasKey(s.Key)
+            if (wanted && !s.Sub) {
+                if (AhiOwner.HasKey(s.Key) || (s.Type != "w" && GetKeyState(s.Name, "P"))) {
+                    pending := true             ; held right now, or another binding still owns the subscription
+                    continue
+                }
+                Core_AhiSubSlot(b, s)
+            } else if (!wanted && s.Sub) {
+                if (Core_AhiSlotHeld(b, s)) {
+                    pending := true             ; still physically down: keep hiding it until released
+                    continue
+                }
+                Core_AhiUnsubSlot(b, s)
+                if (s.Sub)
+                    pending := true             ; unsubscribe failed on some device: retry
+            }
+        }
+    }
+    AhiDirty := pending
+}
+
+Core_AhiSlotHeld(b, s) {
+    prefix := s.Key . "@"
+    held := false
+    crit := A_IsCritical
+    Critical, On
+    for hk in b.Held {
+        if (InStr(hk, prefix) == 1) {
+            held := true
+            break
+        }
+    }
+    Critical, %crit%
+    return held
+}
+
+Core_AhiSubSlot(b, s) {
+    global AHI, AhiKeyboards, AhiMice, AhiOwner
+    ids := (s.Type == "k") ? AhiKeyboards : AhiMice
+    s.Ids := []
+    s.Sub := true
+    AhiOwner[s.Key] := b
+    for _, id in ids {
+        cb := Func("Core_AhiEvent").Bind(b, id, s)
+        try {
+            if (s.Type == "k")
+                AHI.SubscribeKey(id, s.Code, true, cb)
+            else
+                AHI.SubscribeMouseButton(id, s.Code, true, cb)
+            s.Ids.Push(id)
+        } catch e {
+            Core_AhiLog("subscribe FAILED ahiS_" . b.Key . " " . s.Name . " dev " . id . ": " . e.Message)
+        }
+    }
+    s.Fail := 0
+    Core_AhiLog("subscribed ahiS_" . b.Key . " " . s.Name . " on " . s.Ids.Length() . " device(s)")
+}
+
+Core_AhiUnsubSlot(b, s) {
+    global AHI, AhiOwner
+    left := []
+    for _, id in s.Ids {
+        try {
+            if (s.Type == "k")
+                AHI.UnsubscribeKey(id, s.Code)
+            else
+                AHI.UnsubscribeMouseButton(id, s.Code)
+        } catch e {
+            left.Push(id)
+            Core_AhiLog("unsubscribe FAILED ahiS_" . b.Key . " " . s.Name . " dev " . id . ": " . e.Message)
+        }
+    }
+    s.Ids := left
+    if (left.Length() > 0) {
+        s.Fail += 1
+        if (s.Fail <= 40)
+            return                              ; retried on the next reconcile
+        Core_AhiLog("giving up unsubscribing ahiS_" . b.Key . " " . s.Name)
+    }
+    s.Sub := false
+    s.Ids := []
+    s.Fail := 0
+    AhiOwner.Delete(s.Key)
+    Core_AhiLog("unsubscribed ahiS_" . b.Key . " " . s.Name)
+}
+
+; AHI callback (one per device per slot). Reduces raw events to one start / one stop per physical press:
+; auto-repeat is dropped, and when several keys feed one binding (Shift = LShift + RShift, several keyboards)
+; start fires on the first down and stop on the last up.
+; Critical is a THREAD setting that outlives the function: every path must restore it before returning, otherwise the
+; script's timers and threads can never start again. So the bookkeeping lives in Core_AhiTrack (no Critical, free to
+; return anywhere) and this wrapper has exactly one exit.
+Core_AhiEvent(b, devId, s, state) {
+    global AhiLastEvt
+    AhiLastEvt := A_TickCount
+    if (s.Type == "w") {
+        Core_AhiWheel(b, s, state)
+        return
+    }
+    Core_AhiLog("evt ahiS_" . b.Key . " " . s.Key . "@" . devId . " state=" . (state ? 1 : 0))
+    crit := A_IsCritical
+    Critical, On
+    Core_AhiPhysTrack(s, devId, state)
+    act := Core_AhiTrack(b, devId, s, state)
+    Critical, %crit%
+    if (act) {
+        Core_AhiLog((act == 1 ? "start" : "stop") . " ahiS_" . b.Key)
+        Core_AhiCall(b, act == 1 ? 1 : 0)
+    }
+}
+
+; The wheel has no down/up pair, so nothing is tracked: every event is one notch and one call (state 1 = up / right).
+Core_AhiWheel(b, s, state) {
+    up := (state > 0) ? 1 : 0
+    Core_AhiLog("wheel ahiS_" . b.Key . " up=" . up)
+    if (!b.WantKeys.HasKey(s.Key)) {
+        ; block just deactivated and the subscription is not dropped yet: this notch still belongs to the OS
+        if (s.Code == 5)
+            Send, % up ? "{WheelUp}" : "{WheelDown}"
+        else
+            Send, % up ? "{WheelRight}" : "{WheelLeft}"
+        return
+    }
+    Core_AhiCall(b, up)
+}
+
+; Physical state of every subscribed key, independent of ownership (wanted / orphan) so the controller mapping keeps working.
+; Auto-repeat is ignored; a key that went down before it was subscribed has no entry, so its up is ignored too.
+Core_AhiPhysTrack(s, devId, state) {
+    global AhiPhys, AhiPhysN
+    hk := s.Key . "@" . devId
+    n := AhiPhysN.HasKey(s.Key) ? AhiPhysN[s.Key] : 0   ; "" + 1 is "" in AHK v1, so never add to a missing value
+    if (state) {
+        if (!AhiPhys.HasKey(hk)) {
+            AhiPhys[hk] := 1
+            AhiPhysN[s.Key] := n + 1
+        }
+    } else if (AhiPhys.HasKey(hk)) {
+        AhiPhys.Delete(hk)
+        AhiPhysN[s.Key] := (n > 0) ? n - 1 : 0
+    }
+}
+
+; Returns 1 = call start, 2 = call stop, 0 = nothing to do.
+Core_AhiTrack(b, devId, s, state) {
+    global AhiDirty
+    hk := s.Key . "@" . devId
+    wanted := b.WantKeys.HasKey(s.Key)
+    if (state) {
+        if (b.Held.HasKey(hk)) {
+            if (b.Held[hk] == 1 || !wanted)
+                return 0                        ; auto-repeat of a press we own, or an orphan while still inactive
+            ; orphan whose block is live again: this repeat becomes the (late) start of a new press
+        } else if (!wanted) {
+            b.Held[hk] := 2                     ; subscribed only until released: swallow, no action
+            return 0
+        }
+        b.Held[hk] := 1
+        b.Count += 1
+        return (b.Count == 1) ? 1 : 0
+    }
+    if (!b.Held.HasKey(hk))
+        return 0
+    v := b.Held[hk]
+    b.Held.Delete(hk)
+    AhiDirty := true                            ; a pending unsubscribe may now be possible
+    if (v != 1)
+        return 0
+    b.Count -= 1
+    return (b.Count == 0) ? 2 : 0
+}
+
+Core_AhiCall(b, state) {
+    fn := b.Fn
+    if (fn.MaxParams >= 1 || fn.IsVariadic)
+        fn.Call(state)
+    else
+        fn.Call()
+}
+
+Core_AhiLog(msg) {
+    global AhiDebug, ScriptDir
+    if (!AhiDebug)
+        return
+    line := A_Hour . ":" . A_Min . ":" . A_Sec . "." . A_MSec . " " . msg . "`n"
+    path := ScriptDir . "\$AHI_DEBUG.log"
+    FileAppend, %line%, %path%
+}
+
+; Exit: nothing is worth waiting for any more. Release what the target holds and drop every subscription.
+Core_AhiShutdown() {
+    global AhiOn, AhiAll
+    if (!AhiOn)
+        return
+    AhiOn := false
+    pollFn := Func("Core_WheelPoll")
+    SetTimer, % pollFn, Off
+    Core_WheelRelease()
+    for _, b in AhiAll {
+        b.WantKeys := {}
+        Core_AhiOrphan(b)
+        for _, s in b.Slots {
+            if (s.Sub)
+                Core_AhiUnsubSlot(b, s)
+        }
     }
 }
 
